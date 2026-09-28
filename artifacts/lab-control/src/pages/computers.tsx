@@ -14,6 +14,7 @@ import {
   getGetComputersQueryKey,
   getGetLabSummaryQueryKey,
   getLatestScreenshotQueryKey,
+  resolveTenantSlug,
   screenshotFileUrl,
   type Computer,
   type UsbMode,
@@ -70,6 +71,18 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
+
+// The tunnel endpoint is tenant-scoped (/t/:slug/ws/tunnel) because the server
+// authenticates the session inside that tenant's Postgres schema. Returns null
+// outside a tenant context rather than falling back to the bare path, which the
+// server rejects outright.
+function tunnelUrl(computerId: number): string | null {
+  if (typeof window === "undefined") return null;
+  const slug = resolveTenantSlug();
+  if (!slug) return null;
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/t/${slug}/ws/tunnel?role=dashboard&computerId=${computerId}`;
+}
 import {
   Select,
   SelectContent,
@@ -114,8 +127,9 @@ function Computers() {
     if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
       return existing;
     }
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${window.location.host}/ws/tunnel?role=dashboard&computerId=${computerId}`);
+    const url = tunnelUrl(computerId);
+    if (!url) return null;
+    const ws = new WebSocket(url);
     wsPoolRef.current.set(computerId, ws);
     ws.onmessage = (event) => {
       try {
@@ -911,9 +925,11 @@ function RemoteViewDialog({
       return;
     }
 
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host = window.location.host;
-    const url = `${proto}//${host}/ws/tunnel?role=dashboard&computerId=${computer.id}`;
+    const url = tunnelUrl(computer.id);
+    if (!url) {
+      console.error("Cannot open remote view: no tenant context for the tunnel URL");
+      return;
+    }
     const ws = new WebSocket(url);
     wsRef.current = ws;
 

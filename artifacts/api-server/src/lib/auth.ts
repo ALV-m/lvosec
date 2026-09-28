@@ -53,6 +53,9 @@ export const sessionCookieOptions = {
   sameSite: "lax" as const,
   path: "/",
   maxAge: SESSION_TTL_MS,
+  // Send the session token over TLS only. Defaults to on unless explicitly
+  // disabled, so a plain-HTTP local dev server still works.
+  secure: process.env.COOKIE_SECURE !== "false",
 };
 
 export function generateSessionToken(): string {
@@ -74,10 +77,32 @@ export async function deleteSession(token: string): Promise<void> {
   await db.delete(authSessionsTable).where(eq(authSessionsTable.id, token));
 }
 
-export async function resolveSession(req: Request): Promise<AuthUser | null> {
-  const token = typeof req.cookies?.[SESSION_COOKIE] === "string"
-    ? req.cookies[SESSION_COOKIE]
-    : "";
+// Parses a raw `Cookie:` header. Needed for the WebSocket upgrade request,
+// which never passes through `cookie-parser`.
+export function parseCookieHeader(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 1) continue;
+    const name = part.slice(0, eq).trim();
+    if (!name) continue;
+    try {
+      out[name] = decodeURIComponent(part.slice(eq + 1).trim());
+    } catch {
+      out[name] = part.slice(eq + 1).trim();
+    }
+  }
+  return out;
+}
+
+// Resolves a session from a raw cookie header string. Caller must already be
+// inside the correct tenant context (`runInTenant`), because `auth_sessions`
+// lives in the tenant schema.
+export async function resolveSessionFromCookieHeader(
+  cookieHeader: string | undefined,
+): Promise<AuthUser | null> {
+  const token = parseCookieHeader(cookieHeader)[SESSION_COOKIE] ?? "";
   if (!token) return null;
 
   const [row] = await db
@@ -100,6 +125,19 @@ export async function resolveSession(req: Request): Promise<AuthUser | null> {
     role: row.app_users.role as UserRole,
     submenuAccess: row.app_users.submenuAccess as SubmenuKey[],
   };
+}
+
+export async function resolveSession(req: Request): Promise<AuthUser | null> {
+  const header = req.headers.cookie;
+  const fromHeader = await resolveSessionFromCookieHeader(header);
+  if (fromHeader) return fromHeader;
+  // Fall back to the parsed cookie bag for tests/middleware that populate
+  // `req.cookies` directly.
+  const token = typeof req.cookies?.[SESSION_COOKIE] === "string"
+    ? req.cookies[SESSION_COOKIE]
+    : "";
+  if (!token) return null;
+  return resolveSessionFromCookieHeader(`${SESSION_COOKIE}=${token}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +241,18 @@ export function requireSubmenuAccess(
   res.status(403).json({ error: "You do not have access to this section" });
 }
 
+// Whether a user may use a given submenu. Super admins bypass, and "*" is the
+// wildcard grant meaning "every authenticated admin". Used by the WebSocket
+// tunnel, which cannot rely on path-based matching.
+export function hasSubmenuAccess(
+  user: AuthUser,
+  submenu: SubmenuKey,
+): boolean {
+  if (user.role === "super_admin") return true;
+  if (user.submenuAccess.includes("*" as SubmenuKey)) return true;
+  return user.submenuAccess.includes(submenu);
+}
+
 export function requireSuperAdmin(
   req: Request,
   res: Response,
@@ -234,6 +284,7 @@ export const platformSessionCookieOptions = {
   sameSite: "lax" as const,
   path: "/",
   maxAge: SESSION_TTL_MS,
+  secure: process.env.COOKIE_SECURE !== "false",
 };
 
 export async function createPlatformSession(
