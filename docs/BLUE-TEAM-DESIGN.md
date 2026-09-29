@@ -1,6 +1,24 @@
 # LVO Security — Blue Team Design
 
-Status: **proposal, no code written yet**
+> **Implementation status (2026-09-29)**
+>
+> | Phase | Status |
+> |---|---|
+> | §1a WS tunnel auth + §8 hardening | ✅ shipped in PR #1 (`security/server-protection`) |
+> | §4 rename + storage migration | ✅ shipped in PR #2 (`rename/lvosec`), agent 1.20.0 |
+> | §5 posture engine (computed, not persisted) | ✅ shipped in PR #3 (`feat/blue-team`), agent 1.21.0 |
+> | §7 correlation rules (waves + compounding) + IOC record search | ✅ shipped in PR #3 |
+> | WAF-lite + software inventory + Cloudflare edge rules | ✅ shipped in PR #4 (`feat/waf-inventory`), agent 1.22.0 |
+> | §6 FIM / defence-evasion | ⏳ next — see §6 |
+> | Render service rename | ⏳ last, or never (fleet-wide URL dependency, see §1) |
+>
+> Where this doc says "new table" for findings (§5.1), the shipped engine
+> computes posture **on the fly** from `lab_computers.security_signals` +
+> tenant settings and stores nothing — findings stay purely derived and
+> reproduce identically on any redeploy. The dashboard renders `unknown`
+> coverage honestly instead of persisting stale pass/fail.
+
+Status: **shipping, phased — see the table above**
 Target repo: `ALV-m/lab-command-center` → `ALV-m/lvosec`
 
 ---
@@ -458,6 +476,8 @@ event appears, then let it roll.
 1. §8 hardening — small, standalone, fixes live issues
 2. §4 rename + migration — one machine test, then fleet
 3. §5 posture engine
-4. §6 FIM
-5. §7 correlation rules
-6. Render service rename — last, or never
+4. §7 correlation rules (+ IOC record search)
+5. WAF-lite + software inventory + Cloudflare edge rules
+6. §6 FIM — now that posture/correlation/search are live, FIM closes the
+   endpoint layer: agent self-hash + autorun/task enumeration vs baseline
+7. Render service rename — last, or never
