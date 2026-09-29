@@ -42,7 +42,9 @@
 # ============================================================================
 
 param(
-  [string]$ServerUrl = $env:LCC_SERVER_URL,
+  # Renamed from LCC_SERVER_URL. The old variable is still honoured so an
+  # existing per-machine environment variable keeps working after the update.
+  [string]$ServerUrl = $(if ($env:LVOSEC_SERVER_URL) { $env:LVOSEC_SERVER_URL } else { $env:LCC_SERVER_URL }),
   [switch]$Install,
   [int]$IntervalSeconds = 10
 )
@@ -50,14 +52,27 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:AgentVersion = '1.19.0'
-$ConfigDir = Join-Path $env:ProgramData 'LabCommandCenter'
+$script:AgentVersion = '1.20.0'
+
+# Storage identity. Renamed from LabCommandCenter to LvOsSec. Because this
+# directory holds config.json (which carries the agent token), the old one
+# cannot simply be abandoned: Invoke-StorageMigration copies the config across
+# before anything reads it, and re-points the scheduled tasks. A PC whose
+# migration cannot complete keeps running from the old directory rather than
+# dropping off the dashboard.
+$ConfigDir = Join-Path $env:ProgramData 'LvOsSec'
 $ConfigPath = Join-Path $ConfigDir 'config.json'
 $PendingPath = Join-Path $ConfigDir 'pending\checkins.json'
 $AgentPath = Join-Path $ConfigDir 'lab-agent.ps1'
 $LockPath = Join-Path $ConfigDir 'agent.lock'
-$TaskName = 'LabCommandCenter Agent'
-$LogonTaskName = 'LabCommandCenter Logon'
+$TaskName = 'LVOSEC Agent'
+$LogonTaskName = 'LVOSEC Logon'
+
+# Pre-1.20.0 identities, read-only. Used solely by the migration.
+$script:LegacyConfigDir = Join-Path $env:ProgramData 'LabCommandCenter'
+$script:LegacyConfigPath = Join-Path $script:LegacyConfigDir 'config.json'
+$script:LegacyTaskName = 'LabCommandCenter Agent'
+$script:LegacyLogonTaskName = 'LabCommandCenter Logon'
 
 function Write-Log {
   param([string]$Message)
@@ -630,7 +645,7 @@ function Ensure-CaptureLoopScript {
   $content = @'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-$dir = Join-Path $env:ProgramData 'LabCommandCenter'
+$dir = __CONFIG_DIR__
 $frame = Join-Path $dir 'frame.jpg'
 $pidFile = Join-Path $dir 'frame-loop.pid'
 try {
@@ -658,6 +673,11 @@ while ($true) {
   Start-Sleep -Milliseconds 250
 }
 '@
+  # The capture loop is a separate process, so it cannot see $ConfigDir. It is
+  # stamped with the real path here rather than recomputing it, which keeps the
+  # loop writing frames exactly where the agent reads them -- including after a
+  # storage migration, where the old hardcoded directory no longer exists.
+  $content = $content.Replace('__CONFIG_DIR__', ("'" + ($ConfigDir -replace "'", "''") + "'"))
   Set-Content -LiteralPath $script:CaptureLoopScriptPath -Value $content -Encoding UTF8
 }
 
@@ -1684,6 +1704,116 @@ function Sync-PendingCheckins {
     if ($synced -gt 0) { Write-Log ('Synced {0} offline check-in(s) to the dashboard.' -f $synced) }
   } catch {
     Write-Log ('Pending check-in sync failed: {0}' -f $_.Exception.Message)
+  }
+}
+
+function Set-LegacyStorage {
+  # Points every storage variable back at the pre-1.20.0 layout. Used as the
+  # failure path of Invoke-StorageMigration: a PC that cannot complete the move
+  # keeps running exactly as it was, which is always better than a PC that
+  # comes up with no config and re-registers as a new machine.
+  $script:ConfigDir = $script:LegacyConfigDir
+  $script:ConfigPath = $script:LegacyConfigPath
+  $script:PendingPath = Join-Path $script:LegacyConfigDir 'pending\checkins.json'
+  $script:AgentPath = Join-Path $script:LegacyConfigDir 'lab-agent.ps1'
+  $script:LockPath = Join-Path $script:LegacyConfigDir 'agent.lock'
+  $script:TaskName = $script:LegacyTaskName
+  $script:LogonTaskName = $script:LegacyLogonTaskName
+  $script:CheckinScriptPath = Join-Path $script:LegacyConfigDir 'checkin-gate.ps1'
+  $script:GateLauncherPath = Join-Path $script:LegacyConfigDir 'gate-launcher.ps1'
+  $script:logonGateRegisteredFor = ''
+}
+
+function Invoke-StorageMigration {
+  # Moves agent state from ProgramData\LabCommandCenter to ProgramData\LvOsSec.
+  #
+  # Why this cannot just be a rename: config.json holds the agent token that
+  # authenticates this machine, and the scheduled tasks hold an absolute path
+  # to the script. A machine whose config did not come across would re-register
+  # as a brand new computer and orphan its history.
+  #
+  # Ordering matters. This is called before the single-instance lock check and
+  # before Get-Config, because the lock file and config.json both live in the
+  # directory being moved.
+  #
+  # Idempotent: returns immediately when there is nothing to migrate or when the
+  # new layout is already valid. Any failure falls back to the legacy directory
+  # and task names, so the worst case is "the rename did not happen", never
+  # "the machine is offline".
+  if ($ConfigDir -eq $script:LegacyConfigDir) { return }
+  if (-not (Test-Path -LiteralPath $script:LegacyConfigPath)) { return }
+
+  # Already done? A new config that parses and carries a token is authoritative.
+  if (Test-Path -LiteralPath $ConfigPath) {
+    $have = $null
+    try { $have = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $have = $null }
+    if ($have -and $have.token) { return }
+    # Present but unusable (truncated write, partial copy). Fall through and
+    # repair it from the legacy copy.
+    Write-Log 'Existing LvOsSec config is unreadable; repairing it from the previous directory.'
+  }
+
+  Write-Log ('Migrating agent storage to {0} ...' -f $ConfigDir)
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+
+    # 1. config.json. Everything else is rebuildable; this is not.
+    Copy-Item -LiteralPath $script:LegacyConfigPath -Destination $ConfigPath -Force
+
+    # 2. The script itself, so the next self-update has something to replace.
+    $legacyScript = Join-Path $script:LegacyConfigDir 'lab-agent.ps1'
+    if ((Test-Path -LiteralPath $legacyScript) -and -not (Test-Path -LiteralPath $AgentPath)) {
+      Copy-Item -LiteralPath $legacyScript -Destination $AgentPath -Force
+    }
+
+    # 3. The sign-in gate script, for labs that use the check-in gate.
+    $legacyCheckin = Join-Path $script:LegacyConfigDir 'pending\checkins.json'
+    if ((Test-Path -LiteralPath $legacyCheckin) -and -not (Test-Path -LiteralPath $PendingPath)) {
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $PendingPath) | Out-Null
+      Copy-Item -LiteralPath $legacyCheckin -Destination $PendingPath -Force
+    }
+
+    # 4. Prove the new config is usable before touching any task. If the token
+    #    did not come across, the machine is about to go dark, so stop here.
+    $migrated = $null
+    try { $migrated = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $migrated = $null }
+    if (-not ($migrated -and $migrated.token)) {
+      throw 'the copied config has no agent token'
+    }
+
+    # 5. Re-point the scheduled tasks. Register the new one before removing the
+    #    old, so there is never a window with no boot task.
+    $taskCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $AgentPath -ServerUrl $ServerUrl"
+    $createOutput = & schtasks.exe /Create /TN $TaskName /TR $taskCmd /SC ONSTART /RU SYSTEM /RL HIGHEST /F 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      throw ('could not register "{0}": {1}' -f $TaskName, (($createOutput | Out-String).Trim()))
+    }
+    & schtasks.exe /Delete /TN $script:LegacyTaskName /F 2>$null | Out-Null
+    # The logon gate is re-registered by the main loop against the new paths, so
+    # retire the old registration rather than leaving it pointing at the old
+    # directory. Best effort: a failure here only affects gate timing.
+    & schtasks.exe /Delete /TN $script:LegacyLogonTaskName /F 2>$null | Out-Null
+    $script:logonGateRegisteredFor = ''
+
+    Write-Log ('Migrated agent storage to {0}; boot task is now "{1}".' -f $ConfigDir, $TaskName)
+
+    # 6. Retire the old directory. Renamed rather than deleted so nothing is
+    #    destroyed, and a later run of an old script is visibly inert.
+    try {
+      $retired = $script:LegacyConfigDir + '.migrated'
+      if (Test-Path -LiteralPath $retired) { Remove-Item -LiteralPath $retired -Recurse -Force -ErrorAction SilentlyContinue }
+      Rename-Item -LiteralPath $script:LegacyConfigDir -NewName (Split-Path -Leaf $retired) -ErrorAction Stop
+      Write-Log ('Previous agent directory kept as {0}.' -f (Split-Path -Leaf $retired))
+    } catch {
+      Write-Log ('Could not retire the previous directory (harmless): {0}' -f $_.Exception.Message)
+    }
+  } catch {
+    Write-Log ('Storage migration failed, staying on {0}: {1}' -f $script:LegacyConfigDir, $_.Exception.Message)
+    Set-LegacyStorage
+  } finally {
+    $ErrorActionPreference = $prevEap
   }
 }
 
@@ -2929,6 +3059,14 @@ if ($Install) {
   Write-Log 'Installed as a SYSTEM boot task. The agent covers all users and starts before anyone logs in.'
   exit 0
 }
+
+# ---------------------------------------------------------------------------
+# Storage migration (pre-1.20.0 -> LvOsSec)
+# ---------------------------------------------------------------------------
+# Must run before the single-instance guard, which reads the lock file out of
+# $ConfigDir, and before Get-Config, which reads the token. On an already-current
+# machine both of those directories are the same one, so this is a no-op.
+Invoke-StorageMigration
 
 # ---------------------------------------------------------------------------
 # Single-instance guard

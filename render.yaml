@@ -1,4 +1,4 @@
-# Computer Management System — Render blueprint
+# LVO Security — Render blueprint
 # Deploys the Express API + React dashboard.
 #
 # This blueprint deliberately does NOT provision a database. The app connects
@@ -10,6 +10,10 @@
 # See https://render.com/docs/blueprint-spec
 services:
   - type: web
+    # Kept as-is on purpose. This name determines the public subdomain, and
+    # every lab PC's boot task stores an absolute URL pointing at it. Renaming
+    # would take the whole fleet offline until each scheduled task was updated.
+    # Safe to change once the fleet is small enough to re-provision by hand.
     name: computermanagementsystem
     runtime: node
     plan: free

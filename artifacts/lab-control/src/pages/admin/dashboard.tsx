@@ -318,7 +318,7 @@ function AdminDashboard() {
             <div className="leading-tight">
               <p className="text-sm font-bold">Platform Admin</p>
               <p className="text-[11px] text-muted-foreground">
-                Computer Management System
+                LVO Security
               </p>
             </div>
           </div>

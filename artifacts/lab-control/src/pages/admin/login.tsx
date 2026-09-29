@@ -56,7 +56,7 @@ function AdminLoginPage() {
           <div>
             <h1 className="text-xl font-bold">Platform Admin</h1>
             <p className="text-sm text-muted-foreground">
-              Computer Management System — owner access
+              LVO Security — owner access
             </p>
           </div>
         </div>
