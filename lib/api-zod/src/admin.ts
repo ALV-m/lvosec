@@ -1,4 +1,5 @@
 import * as zod from "zod";
+import { CreateComputerActionResponse } from "./generated/api";
 import { TenantAccount, TenantStatus } from "./tenant";
 
 export const AdminAccount = zod.object({
@@ -131,3 +132,63 @@ export type DbConnectionSnapshotResponse = zod.infer<typeof DbConnectionSnapshot
 export const DbConnectionIdParams = zod.object({
   id: zod.coerce.number().int().positive(),
 });
+
+// ---------------------------------------------------------------------------
+// Platform-wide Machines (Super Admin): every tenant's computers/servers with
+// network status (IP, MAC, firewall on/off, last seen) and management actions.
+// ---------------------------------------------------------------------------
+
+export const PlatformMachine = zod.object({
+  tenantId: zod.number(),
+  tenantName: zod.string(),
+  tenantSlug: zod.string(),
+  tenantStatus: zod.string(),
+  id: zod.number(),
+  name: zod.string(),
+  room: zod.string(),
+  status: zod.string(),
+  userName: zod.string().nullable(),
+  lastSeen: zod.string(),
+  os: zod.string().nullable(),
+  agentVersion: zod.string().nullable(),
+  usbState: zod.string(),
+  avEnabled: zod.boolean().nullable(),
+  firewallEnabled: zod.boolean().nullable(),
+  firewallProfiles: zod.string().nullable(),
+  ipAddress: zod.string().nullable(),
+  macAddress: zod.string().nullable(),
+});
+export type PlatformMachine = zod.infer<typeof PlatformMachine>;
+
+export const PlatformMachinesListResponse = zod.object({
+  machines: zod.array(PlatformMachine),
+});
+export type PlatformMachinesListResponse = zod.infer<typeof PlatformMachinesListResponse>;
+
+export const PlatformMachineAction = zod.enum([
+  "lock",
+  "unlock",
+  "restart",
+  "wake",
+  "send_message",
+  "block_usb",
+  "allow_usb",
+  "fw_enable",
+  "fw_disable",
+]);
+export type PlatformMachineAction = zod.infer<typeof PlatformMachineAction>;
+
+export const PlatformMachineActionParams = zod.object({
+  tenantId: zod.coerce.number().int().positive(),
+  computerId: zod.coerce.number().int().positive(),
+});
+export type PlatformMachineActionParams = zod.infer<typeof PlatformMachineActionParams>;
+
+export const PlatformMachineActionBody = zod.object({
+  action: PlatformMachineAction,
+  message: zod.string().trim().max(500).nullish(),
+  payload: zod.string().nullish(),
+});
+export type PlatformMachineActionBody = zod.infer<typeof PlatformMachineActionBody>;
+
+export const PlatformMachineActionResponse = CreateComputerActionResponse;

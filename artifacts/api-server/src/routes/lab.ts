@@ -37,10 +37,9 @@ import {
   UpdateUsbPolicyBody,
   UpdateUsbPolicyResponse,
 } from "@workspace/api-zod";
+import { queueMachineAction } from "../lib/machine-actions";
 
 const router: IRouter = Router();
-
-const REMOTE_VIEW_TTL_MS = 45_000;
 
 const UPLOADS_DIR = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -130,139 +129,18 @@ router.post("/lab/computers/:computerId/actions", async (req, res): Promise<void
     return;
   }
 
-  // server_url_rotate points the agent at a different deployment of this same
-  // app. It is the mechanism behind the Render service rename (see
-  // docs/RENDER-RENAME.md) and must be belt-and-braces validated: an https URL
-  // without credentials, nothing else. The agent independently probes the new
-  // server's health endpoint before committing, so a typo here is caught
-  // twice — once at queue time, once at execution.
-  if (body.data.action === "server_url_rotate") {
-    let payload: { url?: unknown } | null = null;
-    try {
-      payload = body.data.payload ? (JSON.parse(body.data.payload) as { url?: unknown }) : null;
-    } catch {
-      res.status(400).json({ error: "server_url_rotate requires a { \"url\": \"https://…\" } JSON payload" });
-      return;
-    }
-    const candidate = typeof payload?.url === "string" ? payload.url : null;
-    if (!candidate) {
-      res.status(400).json({ error: "server_url_rotate requires a { \"url\": \"https://…\" } JSON payload" });
-      return;
-    }
-    try {
-      const target = new URL(candidate);
-      if (target.protocol !== "https:") {
-        res.status(400).json({ error: "server_url_rotate only accepts https URLs" });
-        return;
-      }
-      if (target.username || target.password) {
-        res.status(400).json({ error: "server_url_rotate URLs must not contain credentials" });
-        return;
-      }
-    } catch {
-      res.status(400).json({ error: "server_url_rotate requires a valid absolute URL" });
-      return;
-    }
-  }
-
-  if (body.data.action === "wake") {
-    if (!computer.macAddress) {
-      res.status(400).json({
-        error: `${computer.name} has not reported a MAC address yet, so Wake-on-LAN cannot be sent.`,
-      });
-      return;
-    }
-    const relayPool = await db
-      .select()
-      .from(computersTable)
-      .where(sql`${computersTable.status} = 'online' AND ${computersTable.lastSeen} > now() - interval '90 seconds' AND ${computersTable.id} <> ${computer.id}`)
-      .orderBy(sql`${computersTable.room} = ${computer.room} DESC`);
-    const relay = relayPool[0];
-    if (!relay) {
-      res.status(400).json({
-        error: "No online computer on the same network is available to relay the wake packet.",
-      });
-      return;
-    }
-    const [relayAction] = await db
-      .insert(actionsTable)
-      .values({
-        computerId: relay.id,
-        action: "wol_relay",
-        message: `Wake ${computer.name} via ${relay.name}`,
-        payload: JSON.stringify({
-          targetMac: computer.macAddress,
-          targetComputerId: computer.id,
-          targetName: computer.name,
-        }),
-        status: "queued",
-      })
-      .returning();
-
-    await db.insert(eventsTable).values({
-      type: "operator_action",
-      message: `Wake-on-LAN requested for ${computer.name} and relayed through ${relay.name}`,
-      actor: "Lab administrator",
-      computerName: computer.name,
-    });
-
-    res.status(201).json(
-      CreateComputerActionResponse.parse({
-        id: relayAction.id,
-        computerId: computer.id,
-        action: "wake",
-        status: "queued",
-        message: `Wake-on-LAN relayed via ${relay.name}`,
-        createdAt: iso(relayAction.createdAt),
-      }),
-    );
-    return;
-  }
-
-  const [action] = await db
-    .insert(actionsTable)
-    .values({
-      computerId: params.data.computerId,
-      action: body.data.action,
-      message: body.data.message ?? null,
-      payload: body.data.payload ?? null,
-      status: "queued",
-    })
-    .returning();
-
-  // Keep a remote view/control session alive so the agent keeps streaming
-  // screenshots and polls fast while the operator is looking at / controlling
-  // the PC. It expires on its own shortly after the last remote action.
-  if (body.data.action === "remote_view" || body.data.action === "remote_input") {
-    await db
-      .update(computersTable)
-      .set({ remoteViewUntil: new Date(Date.now() + REMOTE_VIEW_TTL_MS) })
-      .where(eq(computersTable.id, params.data.computerId));
-  }
-
-  if (body.data.action === "lock") {
-    await db.update(computersTable).set({ status: "locked", checkinRequired: true }).where(eq(computersTable.id, params.data.computerId));
-  } else if (body.data.action === "unlock") {
-    await db.update(computersTable).set({ status: "online", checkinRequired: false }).where(eq(computersTable.id, params.data.computerId));
-  } else if (body.data.action === "block_usb") {
-    await db.update(computersTable).set({ usbState: "blocked" }).where(eq(computersTable.id, params.data.computerId));
-  } else if (body.data.action === "allow_usb") {
-    await db.update(computersTable).set({ usbState: "allowed" }).where(eq(computersTable.id, params.data.computerId));
-  }
-
-  await db.insert(eventsTable).values({
-    type: "operator_action",
-    message: `${body.data.action.replaceAll("_", " ")} queued for ${computer.name}`,
+  const outcome = await queueMachineAction(db, computer, {
+    action: body.data.action,
+    message: body.data.message ?? null,
+    payload: body.data.payload ?? null,
     actor: "Lab administrator",
-    computerName: computer.name,
   });
 
-  res.status(201).json(
-    CreateComputerActionResponse.parse({
-      ...action,
-      createdAt: iso(action.createdAt),
-    }),
-  );
+  if (!outcome.ok || !outcome.queued) {
+    res.status(outcome.httpStatus).json({ error: outcome.error ?? "Action failed" });
+    return;
+  }
+  res.status(outcome.httpStatus).json(CreateComputerActionResponse.parse(outcome.queued));
 });
 
 router.post(
