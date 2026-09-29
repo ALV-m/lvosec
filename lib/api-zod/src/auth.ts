@@ -14,6 +14,7 @@ export const SUBMENUS = [
   "events",
   "checkins",
   "agent",
+  "blue_team",
   "settings",
   "users",
 ] as const;

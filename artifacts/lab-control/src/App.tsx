@@ -11,6 +11,7 @@ import {
   LogOut,
   Menu,
   Monitor,
+  Radar,
   Server,
   ShieldAlert,
   ShieldCheck,
@@ -31,6 +32,7 @@ import type { SubmenuKey } from "@workspace/api-client-react";
 import Agents from "@/pages/agents";
 import Alerts from "@/pages/alerts";
 import Antivirus from "@/pages/antivirus";
+import BlueTeam from "@/pages/blue-team";
 import Checkins from "@/pages/checkins";
 import Computers from "@/pages/computers";
 import Dashboard from "@/pages/dashboard";
@@ -89,6 +91,7 @@ const NAV_SECTIONS: Array<{
     items: [
       { href: "/antivirus", label: "Antivirus", icon: ShieldAlert, submenu: "antivirus" },
       { href: "/firewall", label: "Firewall", icon: ShieldCheck, submenu: "firewall" },
+      { href: "/blue-team", label: "Blue Team", icon: Radar, submenu: "blue_team" },
     ],
   },
   {
@@ -317,6 +320,7 @@ function Layout() {
               <GuardedRoute path="/checkins" submenu="checkins" component={Checkins} />
               <GuardedRoute path="/antivirus" submenu="antivirus" component={Antivirus} />
               <GuardedRoute path="/firewall" submenu="firewall" component={Firewall} />
+              <GuardedRoute path="/blue-team" submenu="blue_team" component={BlueTeam} />
               <GuardedRoute path="/sessions" submenu="sessions" component={Sessions} />
               <GuardedRoute path="/reports" submenu="reports" component={Reports} />
               <GuardedRoute path="/events" submenu="events" component={Events} />

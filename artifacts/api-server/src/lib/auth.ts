@@ -175,6 +175,7 @@ const SUBMENU_ROUTES: Array<{ test: (path: string, method: string) => boolean; s
   { test: (p) => p === "/api/reports", submenu: "reports" },
   { test: (p) => p.startsWith("/api/security/"), submenu: "antivirus" },
   { test: (p) => p.startsWith("/api/security/"), submenu: "firewall" },
+  { test: (p) => p.startsWith("/api/blue-team/"), submenu: "blue_team" },
   { test: (p) => p.startsWith("/api/users"), submenu: "users" },
 ];
 
