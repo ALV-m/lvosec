@@ -52,7 +52,7 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:AgentVersion = '1.22.0'
+$script:AgentVersion = '1.23.0'
 
 # Storage identity. Renamed from LabCommandCenter to LvOsSec. Because this
 # directory holds config.json (which carries the agent token), the old one
@@ -474,6 +474,48 @@ function Push-SoftwareInventory {
     Invoke-RestMethod -Uri ('{0}/api/agent/software' -f $ServerUrl) -Method Post -ContentType 'application/json' -Body $json -TimeoutSec 60 | Out-Null
     $script:SoftwareInventorySentAt = Get-Date
   } catch {}
+}
+
+# ---------------------------------------------------------------------------
+# Server URL rotation
+# ---------------------------------------------------------------------------
+# The Render service rename changes this app's public subdomain, and every
+# machine stores an absolute URL. Rather than reinstall the fleet, an admin
+# queues a server_url_rotate action per machine; the agent validates the new
+# URL (https, no credentials, alive health endpoint), persists it, and starts
+# reporting there. Identity survives because the Postgres database is shared
+# across the old and new deployments — the agent token stays valid, so the
+# heartbeat simply lands on the new service. If it ever does not (separate
+# database), the existing 401 -> re-register path takes over automatically.
+# ---------------------------------------------------------------------------
+function Rotate-ServerUrl {
+  param([string]$NewUrl)
+  $candidate = $NewUrl.Trim().TrimEnd('/')
+  try {
+    $uri = [System.Uri]::new($candidate)
+    if ($uri.Scheme -ne 'https') { return @{ success = $false; detail = 'Server URL must use https.' } }
+    if (-not [string]::IsNullOrWhiteSpace($uri.UserInfo)) { return @{ success = $false; detail = 'Server URL must not contain credentials.' } }
+    if (-not $uri.Host) { return @{ success = $false; detail = 'Server URL has no host.' } }
+  } catch {
+    return @{ success = $false; detail = ("Invalid server URL: {0}" -f $_.Exception.Message) }
+  }
+  # The new deployment must be alive before we commit to it.
+  try {
+    $probe = Invoke-RestMethod -Uri ('{0}/api/healthz' -f $candidate) -Method Get -TimeoutSec 15 -ErrorAction Stop
+    if ($probe.status -ne 'ok') { return @{ success = $false; detail = 'New server responded but reported unhealthy.' } }
+  } catch {
+    return @{ success = $false; detail = ("New server unreachable: {0}" -f $_.Exception.Message) }
+  }
+  $cfg = Get-Config
+  if (-not $cfg) { return @{ success = $false; detail = 'No local configuration to update.' } }
+  $cfg.serverUrl = $candidate
+  Save-Config $cfg
+  $script:ServerUrl = $candidate
+  if ($script:WsState) {
+    $script:WsState.wsBase = ($candidate -replace '^http', 'ws') + '/ws/tunnel'
+  }
+  Write-Log ("Server URL rotated to {0}" -f $candidate)
+  return @{ success = $true; detail = ("Agent now reports to {0}" -f $candidate) }
 }
 
 function Get-Peripherals {
@@ -3150,6 +3192,15 @@ function Execute-Action {
         }
         break
       }
+      'server_url_rotate' {
+        $newUrl = [string]$payload.url
+        if (-not $newUrl) {
+          $result = @{ success = $false; detail = 'Missing url in payload.' }
+          break
+        }
+        $result = Rotate-ServerUrl -NewUrl $newUrl
+        break
+      }
       default {
         $result = @{ success = $true; detail = ('Unknown action: {0}' -f $actionName) }
         break
@@ -3279,16 +3330,15 @@ $script:WsConnected = $false
 $script:WsActionQueue = [System.Collections.Concurrent.ConcurrentQueue[hashtable]]::new()
 
 function Start-WsListener {
-  $wsBase = ($ServerUrl -replace '^http', 'ws') + '/ws/tunnel'
-  $tokenEnc = [System.Uri]::EscapeDataString($config.token)
-  $compId = [long]$config.computerId
-
+  $script:WsState = @{
+    wsBase = ($ServerUrl -replace '^http', 'ws') + '/ws/tunnel'
+    tokenEnc = [System.Uri]::EscapeDataString($config.token)
+    compId = [long]$config.computerId
+  }
   $ps = [powershell]::Create()
   $ps.Runspace = [runspacefactory]::CreateRunspace()
   $ps.Runspace.Open()
-  $ps.Runspace.SessionStateProxy.SetVariable('wsBase', $wsBase)
-  $ps.Runspace.SessionStateProxy.SetVariable('tokenEnc', $tokenEnc)
-  $ps.Runspace.SessionStateProxy.SetVariable('compId', $compId)
+  $ps.Runspace.SessionStateProxy.SetVariable('WsState', $script:WsState)
   $ps.Runspace.SessionStateProxy.SetVariable('WsActionQueue', $script:WsActionQueue)
 
   [void]$ps.AddScript({
@@ -3297,11 +3347,11 @@ function Start-WsListener {
       $ws = $null
       try {
         $ws = [System.Net.WebSockets.ClientWebSocket]::new()
-        $uri = [System.Uri]::new('{0}?role=agent&token={1}' -f $wsBase, $tokenEnc)
+        $uri = [System.Uri]::new('{0}?role=agent&token={1}' -f $WsState.wsBase, $WsState.tokenEnc)
         $cts = [System.Threading.CancellationTokenSource]::new()
         $ws.ConnectAsync($uri, $cts.Token).GetAwaiter().GetResult()
 
-        $hello = [System.Text.Encoding]::UTF8.GetBytes('{"type":"hello","computerId":' + $compId + '}')
+        $hello = [System.Text.Encoding]::UTF8.GetBytes('{"type":"hello","computerId":' + $WsState.compId + '}')
         $null = $ws.SendAsync([System.ArraySegment[byte]]::new($hello), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).GetAwaiter().GetResult()
 
         $script:WsConnected = $true
@@ -3655,6 +3705,13 @@ try {
         Remove-Item -LiteralPath $ConfigPath -Force -ErrorAction SilentlyContinue
         $config = Register-Agent
         $ServerUrl = $config.serverUrl
+        # Keep the WS listener on the same server the heartbeat now uses, even
+        # if it had rotated (or was re-registered against a new deployment).
+        if ($script:WsState) {
+          $script:WsState.wsBase = ($ServerUrl -replace '^http', 'ws') + '/ws/tunnel'
+          $script:WsState.tokenEnc = [System.Uri]::EscapeDataString([string]$config.token)
+          $script:WsState.compId = [long]$config.computerId
+        }
       } else {
         Write-Log ('Heartbeat failed: {0}' -f $_.Exception.Message)
       }
