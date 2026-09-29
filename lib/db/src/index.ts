@@ -106,6 +106,19 @@ const PUBLIC_DDL_STATEMENTS = [
   ALTER TABLE tenants ADD COLUMN IF NOT EXISTS login_token text;
   ALTER TABLE tenants ADD COLUMN IF NOT EXISTS login_token_expires_at timestamptz;
   `,
+  `
+  CREATE TABLE IF NOT EXISTS platform_db_connections (
+    id serial PRIMARY KEY,
+    name text NOT NULL,
+    url text NOT NULL,
+    note text,
+    is_active boolean NOT NULL DEFAULT false,
+    status text NOT NULL DEFAULT 'unknown',
+    last_checked_at timestamptz,
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT now()
+  );
+  `,
 ];
 
 export function schemaNameFor(tenantId: number): string {
@@ -391,3 +404,5 @@ export async function ensureAllTenantSchemas(tenantIds: number[]): Promise<void>
 export async function dropTenantSchema(tenantId: number): Promise<void> {
   await pool.query(`DROP SCHEMA IF EXISTS "${schemaNameFor(tenantId)}" CASCADE`);
 }
+
+export * from "./db-connections";
