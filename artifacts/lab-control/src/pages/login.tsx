@@ -89,7 +89,7 @@ function LoginPage({ slug }: { slug?: string }) {
             <Server className="size-6" />
           </div>
           <div>
-            <h1 className="text-xl font-bold">Computer Management System</h1>
+            <h1 className="text-xl font-bold">LVO Security</h1>
             <p className="text-sm text-muted-foreground">
               Computer Manager
             </p>

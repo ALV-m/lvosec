@@ -1,4 +1,4 @@
-# Computer Management System
+# LVO Security
 
 A multi-tenant computer-lab management platform. Organizations self-register at `/register` and each gets its own isolated workspace at `/t/<slug>` with a full management dashboard: track computers, run operator actions (lock, unlock, restart, send messages, push files), monitor alerts, control USB policies with scan-before-use approval, and record student attendance and violations — all behind one Express API that also serves the React frontend. Each lab PC runs a zero-dependency PowerShell agent (`lab-agent.ps1`) that phones home to the server.
 
@@ -32,7 +32,7 @@ A multi-tenant computer-lab management platform. Organizations self-register at 
 ## Repository layout
 
 ```
-computermanagementsystem/
+lvosec/                    # formerly lab-command-center
 ├── artifacts/
 │   ├── api-server/          # Express API, serves the built frontend too
 │   └── lab-control/         # React dashboard (Vite)
@@ -211,6 +211,38 @@ The agent registers the PC (its name becomes the computer name in the dashboard)
 
 To enable automatic logout after inactivity, open the **Agent** page and set **Idle minutes** (0 disables it). Agents read the threshold from their heartbeat and log the user off when keyboard/mouse input has been idle for that long.
 
+### Agent upgrades and the LvOsSec rename
+
+Agents update themselves. The server reports its bundled agent version on every
+heartbeat; an agent whose version is older downloads the new script,
+syntax-checks it, swaps it in and hands off to a fresh process. **No reinstall
+and no PC-side action is needed** — pushing a new agent version reaches the whole
+fleet within one heartbeat interval.
+
+Agent **1.20.0** renames the on-disk identity to match the product:
+
+| | before | after |
+|---|---|---|
+| Storage | `C:\ProgramData\LabCommandCenter` | `C:\ProgramData\LvOsSec` |
+| Boot task | `LabCommandCenter Agent` | `LVOSEC Agent` |
+| Logon task | `LabCommandCenter Logon` | `LVOSEC Logon` |
+| Env var | `LCC_SERVER_URL` | `LVOSEC_SERVER_URL` (old still read) |
+
+The agent carries its own state across on first run after the update: it copies
+`config.json` (which holds the token that authenticates the PC) to the new
+directory, re-registers the boot task against the new path, retires the old task
+names, and renames the old directory to `LabCommandCenter.migrated` — it is
+renamed, not deleted.
+
+If any part of that fails, the agent logs the reason and **continues using the
+old directory and old task names**, so the worst case is "the rename did not
+happen", never "the PC dropped off the dashboard". A machine is only considered
+migrated once the new `config.json` is readable *and* carries a token, so a
+truncated copy cannot orphan a PC.
+
+Nothing here needs a reinstall. To confirm a PC moved over, check that
+`C:\ProgramData\LvOsSec\config.json` exists on it.
+
 ## Deploying to Render
 
 The `render.yaml` blueprint defines the **web service** (free tier). It deliberately does **not** provision a database — the app connects to a database you already run, so it plays nicely with your other projects on a shared Postgres.
@@ -224,6 +256,14 @@ Why it's safe to share a database:
 To deploy:
 
 1. Render dashboard → **New → Blueprint** and connect the repository. The service is named `computermanagementsystem` (subdomain `computermanagementsystem.onrender.com`).
+
+   > **Not renamed to `lvosec` on purpose.** The Render service name determines the
+   > subdomain, and every lab PC's boot task holds an absolute
+   > `computermanagementsystem.onrender.com` URL. Renaming the service changes
+   > the subdomain and silently takes the whole fleet offline until each PC's
+   > scheduled task is updated. Rename it when the fleet is small, or plan the
+   > task update as part of the rename. The `lvosec` name is already used for
+   > the repository, the package, and the product itself.
 2. Pick the repo; Render creates the web service (no database resource).
 3. Open the service → **Environment** and set:
    - `DATABASE_URL` to the connection string of the database you want to share:
@@ -238,9 +278,17 @@ Note: the shared database must be reachable from Render — Render-managed datab
 ## Verification
 
 ```sh
-pnpm run typecheck   # typechecks libs (tsc --build) + all packages
-pnpm run build       # bundles the API and builds the dashboard
+pnpm run typecheck     # typechecks libs (tsc --build) + all packages
+pnpm run build         # bundles the API and builds the dashboard
+pnpm --filter @workspace/scripts test:agent   # agent storage migration + file-op confinement
 ```
+
+The agent tests run on any platform with `pwsh`. They load the real functions
+out of the shipped `lab-agent.ps1` and assert the two things that would damage a
+lab if they broke: that a PC keeps its token and identity through the LvOsSec
+storage migration, and that `delete_file` cannot point outside the allowed write
+roots. Both paths are covered, including the failure path where the migration
+cannot complete and the agent has to stay on the legacy directory.
 
 ## License
 
