@@ -8,13 +8,16 @@
 # The app never conflicts with other projects on a shared database because all
 # tenant data lives in its own Postgres schema (t<id>).
 # See https://render.com/docs/blueprint-spec
+#
+# RENAMED: this service used to be `computermanagementsystem`. The name is the
+# public subdomain and every lab PC stores the absolute URL, so the rename is
+# executed with the agent's server_url_rotate action — machines move to the
+# new URL *before* the old one is retired, and the shared Postgres keeps their
+# token valid across the change. Do not rename casually; follow the runbook:
+#   docs/RENDER-RENAME.md
 services:
   - type: web
-    # Kept as-is on purpose. This name determines the public subdomain, and
-    # every lab PC's boot task stores an absolute URL pointing at it. Renaming
-    # would take the whole fleet offline until each scheduled task was updated.
-    # Safe to change once the fleet is small enough to re-provision by hand.
-    name: computermanagementsystem
+    name: lvosec
     runtime: node
     plan: free
     rootDir: .

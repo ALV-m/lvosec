@@ -130,6 +130,41 @@ router.post("/lab/computers/:computerId/actions", async (req, res): Promise<void
     return;
   }
 
+  // server_url_rotate points the agent at a different deployment of this same
+  // app. It is the mechanism behind the Render service rename (see
+  // docs/RENDER-RENAME.md) and must be belt-and-braces validated: an https URL
+  // without credentials, nothing else. The agent independently probes the new
+  // server's health endpoint before committing, so a typo here is caught
+  // twice — once at queue time, once at execution.
+  if (body.data.action === "server_url_rotate") {
+    let payload: { url?: unknown } | null = null;
+    try {
+      payload = body.data.payload ? (JSON.parse(body.data.payload) as { url?: unknown }) : null;
+    } catch {
+      res.status(400).json({ error: "server_url_rotate requires a { \"url\": \"https://…\" } JSON payload" });
+      return;
+    }
+    const candidate = typeof payload?.url === "string" ? payload.url : null;
+    if (!candidate) {
+      res.status(400).json({ error: "server_url_rotate requires a { \"url\": \"https://…\" } JSON payload" });
+      return;
+    }
+    try {
+      const target = new URL(candidate);
+      if (target.protocol !== "https:") {
+        res.status(400).json({ error: "server_url_rotate only accepts https URLs" });
+        return;
+      }
+      if (target.username || target.password) {
+        res.status(400).json({ error: "server_url_rotate URLs must not contain credentials" });
+        return;
+      }
+    } catch {
+      res.status(400).json({ error: "server_url_rotate requires a valid absolute URL" });
+      return;
+    }
+  }
+
   if (body.data.action === "wake") {
     if (!computer.macAddress) {
       res.status(400).json({
