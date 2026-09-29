@@ -44,6 +44,13 @@ export const computersTable = pgTable("lab_computers", {
   cpuCores: integer("cpu_cores"),
   diskTotal: bigint("disk_total", { mode: "number" }),
   diskFree: bigint("disk_free", { mode: "number" }),
+  // Ad-hoc security signals reported by the agent and consumed by the posture
+  // engine (lib/blue-team/posture.ts). Tri-state in spirit: a missing key means
+  // "not reported yet", which the engine returns as `unknown`, never `pass`.
+  securitySignals: jsonb("security_signals"),
+  // Installed-software snapshot, reported by the agent on a slow timer (not on
+  // every heartbeat). Shape matches SoftwareEntry (name, version, publisher).
+  installedSoftware: jsonb("installed_software"),
 });
 
 export const actionsTable = pgTable("lab_actions", {

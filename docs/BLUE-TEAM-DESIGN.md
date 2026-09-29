@@ -1,7 +1,25 @@
 # LVO Security — Blue Team Design
 
-Status: **proposal, no code written yet**
-Target repo: `ALV-m/lab-command-center` → `ALV-m/lvosec`
+> **Implementation status (2026-09-29)**
+>
+> | Phase | Status |
+> |---|---|
+> | §1a WS tunnel auth + §8 hardening | ✅ shipped in PR #1 (`security/server-protection`) |
+> | §4 rename + storage migration | ✅ shipped in PR #2 (`rename/lvosec`), agent 1.20.0 |
+> | §5 posture engine (computed, not persisted) | ✅ shipped in PR #3 (`feat/blue-team`), agent 1.21.0 |
+> | §7 correlation rules (waves + compounding) + IOC record search | ✅ shipped in PR #3 |
+> | WAF-lite + software inventory + Cloudflare edge rules | ✅ shipped in PR #4 (`feat/waf-inventory`), agent 1.22.0 |
+> | Render service rename (agent `server_url_rotate`) | ✅ shipped in PR #5 (`infra/render-rename`), agent 1.23.0 — runbook: `docs/RENDER-RENAME.md` |
+> | §6 FIM / defence-evasion | ⏳ next — see §6 |
+>
+> Where this doc says "new table" for findings (§5.1), the shipped engine
+> computes posture **on the fly** from `lab_computers.security_signals` +
+> tenant settings and stores nothing — findings stay purely derived and
+> reproduce identically on any redeploy. The dashboard renders `unknown`
+> coverage honestly instead of persisting stale pass/fail.
+
+Status: **shipping, phased — see the table above**
+Target repo: `ALV-m/lvosec` (renamed from `ALV-m/lab-command-center`)
 
 ---
 
@@ -432,7 +450,7 @@ at the same time. Worth a comment in the code so nobody flips it casually.
 | Migration loses an agent token | Hard verification gate (§4.3 step 4) + legacy dir renamed not deleted |
 | Migration runs twice / mid-flight | Idempotent; re-entrant; legacy path still works if it fails |
 | Two agents run at once | Migration precedes the lock check at `:2847` |
-| Render service rename breaks the live URL | `render.yaml:13` change alters the service name and likely subdomain. **Your call — this breaks `computermanagementsystem.onrender.com` until DNS updates.** Agents hold the old URL in `config.json`; they'd fail to reach the server. Recommend renaming the service **last**, after the fleet is confirmed migrated, or leaving it. |
+| Render service rename breaks the live URL | Solved, not mitigated: agent ≥ 1.23.0 handles a `server_url_rotate` action (validates https + probes healthz before committing), and machine identity survives because tenants share one Postgres. Execute per `docs/RENDER-RENAME.md` — rotate the fleet **before** retiring the old service. |
 | GitHub repo rename | GitHub redirects old clones, but any hardcoded URL or CI reference needs updating. |
 | Posture checks fire noisily on first run | Seed `status` as `unknown` and only escalate after two consecutive observations. |
 
@@ -458,6 +476,9 @@ event appears, then let it roll.
 1. §8 hardening — small, standalone, fixes live issues
 2. §4 rename + migration — one machine test, then fleet
 3. §5 posture engine
-4. §6 FIM
-5. §7 correlation rules
-6. Render service rename — last, or never
+4. §7 correlation rules (+ IOC record search)
+5. WAF-lite + software inventory + Cloudflare edge rules
+6. Render service rename — safe now: agent `server_url_rotate` moves the fleet
+   without a reinstall (`docs/RENDER-RENAME.md`)
+7. §6 FIM — now that posture/correlation/search are live, FIM closes the
+   endpoint layer: agent self-hash + autorun/task enumeration vs baseline

@@ -14,6 +14,7 @@ export const SUBMENU_LABELS: Record<SubmenuKey, string> = {
   events: "Events",
   checkins: "Check-ins",
   agent: "Agent",
+  blue_team: "Blue Team",
   settings: "Settings",
   users: "Users",
 };
@@ -32,6 +33,7 @@ export const SUBMENU_HREFS: Record<SubmenuKey, string> = {
   events: "/events",
   checkins: "/checkins",
   agent: "/agents",
+  blue_team: "/blue-team",
   settings: "/agents",
   users: "/users",
 };
@@ -50,6 +52,7 @@ export const ALL_SUBMENUS: SubmenuKey[] = [
   "events",
   "checkins",
   "agent",
+  "blue_team",
   "settings",
   "users",
 ];

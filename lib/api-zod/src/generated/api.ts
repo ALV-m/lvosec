@@ -77,7 +77,7 @@ export const CreateComputerActionParams = zod.object({
 })
 
 export const CreateComputerActionBody = zod.object({
-  "action": zod.enum(['lock', 'unlock', 'restart', 'wake', 'send_message', 'remote_view', 'remote_control', 'remote_input', 'block_usb', 'allow_usb', 'push_file', 'delete_file', 'av_scan', 'av_update', 'av_toggle', 'fw_enable', 'fw_disable']),
+  "action": zod.enum(['lock', 'unlock', 'restart', 'wake', 'send_message', 'remote_view', 'remote_control', 'remote_input', 'block_usb', 'allow_usb', 'push_file', 'delete_file', 'av_scan', 'av_update', 'av_toggle', 'fw_enable', 'fw_disable', 'server_url_rotate']),
   "message": zod.string().nullish(),
   "payload": zod.string().nullish()
 })

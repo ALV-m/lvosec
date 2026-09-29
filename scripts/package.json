@@ -6,7 +6,7 @@
   "scripts": {
     "bootstrap": "tsx src/bootstrap.ts",
     "seed": "tsx src/seed.ts",
-    "test:agent": "pwsh -NoProfile -File agent-tests/test-storage-migration.ps1 && pwsh -NoProfile -File agent-tests/test-fileop-confinement.ps1",
+    "test:agent": "pwsh -NoProfile -File agent-tests/test-storage-migration.ps1 && pwsh -NoProfile -File agent-tests/test-fileop-confinement.ps1 && pwsh -NoProfile -File agent-tests/test-server-url-rotation.ps1",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

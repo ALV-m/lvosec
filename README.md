@@ -255,15 +255,14 @@ Why it's safe to share a database:
 
 To deploy:
 
-1. Render dashboard → **New → Blueprint** and connect the repository. The service is named `computermanagementsystem` (subdomain `computermanagementsystem.onrender.com`).
+1. Render dashboard → **New → Blueprint** and connect the repository. The service is named `lvosec` (subdomain `lvosec.onrender.com`).
 
-   > **Not renamed to `lvosec` on purpose.** The Render service name determines the
-   > subdomain, and every lab PC's boot task holds an absolute
-   > `computermanagementsystem.onrender.com` URL. Renaming the service changes
-   > the subdomain and silently takes the whole fleet offline until each PC's
-   > scheduled task is updated. Rename it when the fleet is small, or plan the
-   > task update as part of the rename. The `lvosec` name is already used for
-   > the repository, the package, and the product itself.
+   > **About renames.** The Render service name determines the subdomain, and
+   > every lab PC's boot task holds an absolute URL to it. This is exactly why
+   > the agent (≥ 1.23.0) can be moved with the `server_url_rotate` action
+   > instead of a reinstall. If you ever need to move the fleet to a new
+   > deployment, follow `docs/RENDER-RENAME.md` — never rename the service and
+   > hope the machines follow.
 2. Pick the repo; Render creates the web service (no database resource).
 3. Open the service → **Environment** and set:
    - `DATABASE_URL` to the connection string of the database you want to share:

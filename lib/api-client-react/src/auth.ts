@@ -33,6 +33,7 @@ export type SubmenuKey =
   | "events"
   | "checkins"
   | "agent"
+  | "blue_team"
   | "settings"
   | "users";
 

@@ -35,6 +35,8 @@ import {
   AgentRegisterBody,
   AgentRegisterResponse,
   AgentScreenshotResponse,
+  AgentSoftwareBody,
+  AgentSoftwareResponse,
   AgentUploadResponse,
   ReportFileListingBody,
 } from "@workspace/api-zod";
@@ -257,6 +259,10 @@ router.post("/agent/heartbeat", async (req, res): Promise<void> => {
       cpuCores: body.data.cpuCores ?? computer.cpuCores,
       diskTotal: body.data.diskTotal ?? computer.diskTotal,
       diskFree: body.data.diskFree ?? computer.diskFree,
+      // The agent sends its full security snapshot with every heartbeat, so
+      // store it wholesale. Old agents never send it and leave the last value
+      // in place, which is the correct stale-but-known outcome.
+      securitySignals: body.data.security ?? computer.securitySignals,
     })
     .where(eq(computersTable.id, computer.id));
 
@@ -741,6 +747,36 @@ router.post("/agent/events", async (req, res): Promise<void> => {
   }
 
   res.json(AgentEventResponse.parse({ ok: true }));
+});
+
+/**
+ * Installed-software snapshot. Separate from the heartbeat on purpose: the
+ * heartbeat runs every 10 seconds and must stay small; software changes about
+ * once a session at most, so the agent should send it on a slow timer.
+ */
+router.post("/agent/software", async (req, res): Promise<void> => {
+  const body = AgentSoftwareBody.safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: body.error.message });
+    return;
+  }
+
+  const [computer] = await db
+    .select()
+    .from(computersTable)
+    .where(eq(computersTable.agentToken, body.data.token))
+    .limit(1);
+  if (!computer) {
+    res.status(401).json({ error: "Invalid agent token" });
+    return;
+  }
+
+  await db
+    .update(computersTable)
+    .set({ installedSoftware: body.data.software })
+    .where(eq(computersTable.id, computer.id));
+
+  res.json(AgentSoftwareResponse.parse({ ok: true }));
 });
 
 router.post(

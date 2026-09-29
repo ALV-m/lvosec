@@ -57,6 +57,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useAdminAuth } from "@/lib/admin-auth";
+import { DbManagementSection } from "./db-management";
 
 function StatCard({
   icon: Icon,
@@ -449,6 +450,8 @@ function AdminDashboard() {
             </Table>
           </CardContent>
         </Card>
+
+        <DbManagementSection />
       </main>
 
       <ResetPasswordDialog tenant={resetTarget} onOpenChange={(open) => { if (!open) setResetTarget(null); }} />

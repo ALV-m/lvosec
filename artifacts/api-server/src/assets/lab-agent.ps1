@@ -52,7 +52,7 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:AgentVersion = '1.20.0'
+$script:AgentVersion = '1.23.0'
 
 # Storage identity. Renamed from LabCommandCenter to LvOsSec. Because this
 # directory holds config.json (which carries the agent token), the old one
@@ -312,6 +312,210 @@ function Get-FirewallStatus {
     }
   } catch {}
   return $result
+}
+
+# ---------------------------------------------------------------------------
+# Security posture signals
+# ---------------------------------------------------------------------------
+# A snapshot of cheap, read-only checks consumed by the server's posture engine
+# (blue-team/posture.ts). The engine treats a missing member as "unknown",
+# never as "pass", so a check that cannot run on a given machine simply leaves
+# that key absent -- it never turns a blind spot into a clean bill of health.
+#
+# The expensive checks (BitLocker, TPM, Secure Boot, local admins) refresh on a
+# 5-minute timer; the rest are registry reads that run every refresh too. The
+# heartbeat attaches the cached snapshot to every request, so the server always
+# sees the full picture without the 10-second loop paying for the cost.
+# ---------------------------------------------------------------------------
+
+$script:SecuritySignalsCache = $null
+$script:SecuritySignalsCacheAt = (Get-Date).AddMinutes(-10)
+
+function Read-RegDword {
+  param([string]$Path, [string]$Name, [int]$Default = $null)
+  try {
+    $v = (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name
+    return [int]$v
+  } catch { return $Default }
+}
+
+function Get-SecuritySignals {
+  # Refresh at most every five minutes.
+  $elapsed = (Get-Date) - $script:SecuritySignalsCacheAt
+  if ($script:SecuritySignalsCache -and $elapsed.TotalMinutes -lt 5) {
+    return $script:SecuritySignalsCache
+  }
+  $script:SecuritySignalsCacheAt = Get-Date
+
+  $s = @{}
+
+  # --- Defender -------------------------------------------------------------
+  try {
+    $pref = Get-MpPreference -ErrorAction Stop
+    $mp = Get-MpComputerStatus -ErrorAction Stop
+    $s.avRealtimeProtection = -not [bool]$pref.DisableRealtimeMonitoring
+    $s.avTamperProtection = [bool]$mp.IsTamperProtected
+    $excl = @($pref.ExclusionPath) + @($pref.ExclusionExtension) + @($pref.ExclusionProcess)
+    $s.avExclusionCount = @($excl | Where-Object { $_ }).Count
+    if ($mp.AntivirusSignatureLastUpdated) {
+      $s.avSignatureAgeDays = [int]([Math]::Floor(((Get-Date) - $mp.AntivirusSignatureLastUpdated.ToLocalTime()).TotalDays))
+      if ($s.avSignatureAgeDays -lt 0) { $s.avSignatureAgeDays = 0 }
+    }
+    # A policy entry that disables the product is different from a student
+    # turning it off locally -- it means something is forcing it back off.
+    $policyRealtime = Read-RegDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' 'DisableRealtimeMonitoring' 0
+    $policyAntiSpy = Read-RegDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' 'DisableAntiSpyware' 0
+    $s.avDisabledByPolicy = ($policyRealtime -eq 1) -or ($policyAntiSpy -eq 1)
+  } catch {}
+
+  # --- Firewall -------------------------------------------------------------
+  try {
+    $fw = @(Get-NetFirewallProfile -ErrorAction Stop)
+    $s.firewallAllProfiles = ($fw.Count -gt 0) -and (@($fw | Where-Object { $_.Enabled -ne $true }).Count -eq 0)
+  } catch {}
+
+  # --- SMB / network --------------------------------------------------------
+  $smb1 = Read-RegDword 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1' 0
+  if ($smb1 -ne $null) { $s.smb1Enabled = ($smb1 -eq 1) }
+  $smbSigning = Read-RegDword 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'RequireSecuritySignature' 0
+  if ($smbSigning -ne $null) { $s.smbSigningRequired = ($smbSigning -eq 1) }
+  $rdpDeny = Read-RegDword 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' $null
+  if ($rdpDeny -ne $null) { $s.rdpEnabled = ($rdpDeny -eq 0) }
+
+  # --- Encryption / hardware ------------------------------------------------
+  try {
+    $vol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
+    $s.bitlockerEnabled = ($vol.ProtectionStatus -eq 'On')
+  } catch {}
+  try {
+    $tpm = Get-Tpm -ErrorAction Stop
+    $s.tpmPresent = [bool]$tpm.TpmPresent
+  } catch {}
+  try {
+    $s.secureBootEnabled = [bool](Confirm-SecureBootUEFI)
+  } catch {
+    # Non-UEFI machines throw here; Secure Boot genuinely cannot be evaluated.
+    $s.secureBootEnabled = $null
+  }
+
+  # --- OS configuration -----------------------------------------------------
+  $uac = Read-RegDword 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'EnableLUA' 1
+  $s.uacEnabled = ($uac -eq 1)
+  $noLockScreen = Read-RegDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization' 'NoLockScreen' 0
+  $s.screenLockEnabled = -not [bool]$noLockScreen
+  $noAutoRun = Read-RegDword 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'NoDriveTypeAutoRun' 0
+  $s.autorunEnabled = (($noAutoRun -band 0xFF) -eq 0)
+  $auPolicy = Read-RegDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoUpdate' 0
+  $auCurrent = Read-RegDword 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update' 'NoAutoUpdate' 0
+  $s.windowsUpdateDisabled = ([bool]$auPolicy) -or ([bool]$auCurrent)
+  $autoLogon = try { [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction Stop).AutoAdminLogon } catch { '' }
+  $s.autoLogonEnabled = ($autoLogon -eq '1')
+
+  try {
+    $guest = Get-LocalUser -Name 'Guest' -ErrorAction Stop
+    $s.guestAccountEnabled = [bool]$guest.Enabled
+  } catch {}
+  try {
+    $admins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop)
+    $s.localAdminCount = $admins.Count
+  } catch {}
+
+  $script:SecuritySignalsCache = $s
+  return $s
+}
+
+# ---------------------------------------------------------------------------
+# Installed-software inventory
+# ---------------------------------------------------------------------------
+# Registry Uninstall keys are the one source that exists on every Windows
+# build and works as SYSTEM without extra modules. Sent to the server on a
+# one-hour timer, never on the 10-second heartbeat.
+
+$script:SoftwareInventoryCache = $null
+$script:SoftwareInventorySentAt = (Get-Date).AddHours(-2)
+
+function Get-SoftwareInventory {
+  if ($script:SoftwareInventoryCache) { return $script:SoftwareInventoryCache }
+  $seen = @{}
+  $list = @()
+  $roots = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )
+  foreach ($root in $roots) {
+    try {
+      $keys = @(Get-ItemProperty -LiteralPath $root -ErrorAction Stop)
+      foreach ($entry in $keys) {
+        if (-not $entry.PSChildName -or -not $entry.DisplayName) { continue }
+        # System components and updates are uninteresting to an inventory.
+        if ($entry.PSChildName -like 'KB*' -or $entry.SystemComponent -eq 1) { continue }
+        $name = ([string]$entry.DisplayName).Trim()
+        if (-not $name -or $seen.ContainsKey($name.ToLowerInvariant())) { continue }
+        $seen[$name.ToLowerInvariant()] = $true
+        $item = @{ name = $name }
+        if ($entry.DisplayVersion) { $item.version = [string]$entry.DisplayVersion }
+        if ($entry.Publisher) { $item.publisher = [string]$entry.Publisher }
+        $list += $item
+      }
+    } catch {}
+  }
+  $script:SoftwareInventoryCache = @($list | Sort-Object name)
+  return $script:SoftwareInventoryCache
+}
+
+function Push-SoftwareInventory {
+  try {
+    $sw = Get-SoftwareInventory
+    if (-not $sw) { return }
+    $config = Get-Config
+    $body = @{ token = $config.token; software = $sw }
+    $json = $body | ConvertTo-Json -Compress -Depth 4
+    Invoke-RestMethod -Uri ('{0}/api/agent/software' -f $ServerUrl) -Method Post -ContentType 'application/json' -Body $json -TimeoutSec 60 | Out-Null
+    $script:SoftwareInventorySentAt = Get-Date
+  } catch {}
+}
+
+# ---------------------------------------------------------------------------
+# Server URL rotation
+# ---------------------------------------------------------------------------
+# The Render service rename changes this app's public subdomain, and every
+# machine stores an absolute URL. Rather than reinstall the fleet, an admin
+# queues a server_url_rotate action per machine; the agent validates the new
+# URL (https, no credentials, alive health endpoint), persists it, and starts
+# reporting there. Identity survives because the Postgres database is shared
+# across the old and new deployments — the agent token stays valid, so the
+# heartbeat simply lands on the new service. If it ever does not (separate
+# database), the existing 401 -> re-register path takes over automatically.
+# ---------------------------------------------------------------------------
+function Rotate-ServerUrl {
+  param([string]$NewUrl)
+  $candidate = $NewUrl.Trim().TrimEnd('/')
+  try {
+    $uri = [System.Uri]::new($candidate)
+    if ($uri.Scheme -ne 'https') { return @{ success = $false; detail = 'Server URL must use https.' } }
+    if (-not [string]::IsNullOrWhiteSpace($uri.UserInfo)) { return @{ success = $false; detail = 'Server URL must not contain credentials.' } }
+    if (-not $uri.Host) { return @{ success = $false; detail = 'Server URL has no host.' } }
+  } catch {
+    return @{ success = $false; detail = ("Invalid server URL: {0}" -f $_.Exception.Message) }
+  }
+  # The new deployment must be alive before we commit to it.
+  try {
+    $probe = Invoke-RestMethod -Uri ('{0}/api/healthz' -f $candidate) -Method Get -TimeoutSec 15 -ErrorAction Stop
+    if ($probe.status -ne 'ok') { return @{ success = $false; detail = 'New server responded but reported unhealthy.' } }
+  } catch {
+    return @{ success = $false; detail = ("New server unreachable: {0}" -f $_.Exception.Message) }
+  }
+  $cfg = Get-Config
+  if (-not $cfg) { return @{ success = $false; detail = 'No local configuration to update.' } }
+  $cfg.serverUrl = $candidate
+  Save-Config $cfg
+  $script:ServerUrl = $candidate
+  if ($script:WsState) {
+    $script:WsState.wsBase = ($candidate -replace '^http', 'ws') + '/ws/tunnel'
+  }
+  Write-Log ("Server URL rotated to {0}" -f $candidate)
+  return @{ success = $true; detail = ("Agent now reports to {0}" -f $candidate) }
 }
 
 function Get-Peripherals {
@@ -2988,6 +3192,15 @@ function Execute-Action {
         }
         break
       }
+      'server_url_rotate' {
+        $newUrl = [string]$payload.url
+        if (-not $newUrl) {
+          $result = @{ success = $false; detail = 'Missing url in payload.' }
+          break
+        }
+        $result = Rotate-ServerUrl -NewUrl $newUrl
+        break
+      }
       default {
         $result = @{ success = $true; detail = ('Unknown action: {0}' -f $actionName) }
         break
@@ -3117,16 +3330,15 @@ $script:WsConnected = $false
 $script:WsActionQueue = [System.Collections.Concurrent.ConcurrentQueue[hashtable]]::new()
 
 function Start-WsListener {
-  $wsBase = ($ServerUrl -replace '^http', 'ws') + '/ws/tunnel'
-  $tokenEnc = [System.Uri]::EscapeDataString($config.token)
-  $compId = [long]$config.computerId
-
+  $script:WsState = @{
+    wsBase = ($ServerUrl -replace '^http', 'ws') + '/ws/tunnel'
+    tokenEnc = [System.Uri]::EscapeDataString($config.token)
+    compId = [long]$config.computerId
+  }
   $ps = [powershell]::Create()
   $ps.Runspace = [runspacefactory]::CreateRunspace()
   $ps.Runspace.Open()
-  $ps.Runspace.SessionStateProxy.SetVariable('wsBase', $wsBase)
-  $ps.Runspace.SessionStateProxy.SetVariable('tokenEnc', $tokenEnc)
-  $ps.Runspace.SessionStateProxy.SetVariable('compId', $compId)
+  $ps.Runspace.SessionStateProxy.SetVariable('WsState', $script:WsState)
   $ps.Runspace.SessionStateProxy.SetVariable('WsActionQueue', $script:WsActionQueue)
 
   [void]$ps.AddScript({
@@ -3135,11 +3347,11 @@ function Start-WsListener {
       $ws = $null
       try {
         $ws = [System.Net.WebSockets.ClientWebSocket]::new()
-        $uri = [System.Uri]::new('{0}?role=agent&token={1}' -f $wsBase, $tokenEnc)
+        $uri = [System.Uri]::new('{0}?role=agent&token={1}' -f $WsState.wsBase, $WsState.tokenEnc)
         $cts = [System.Threading.CancellationTokenSource]::new()
         $ws.ConnectAsync($uri, $cts.Token).GetAwaiter().GetResult()
 
-        $hello = [System.Text.Encoding]::UTF8.GetBytes('{"type":"hello","computerId":' + $compId + '}')
+        $hello = [System.Text.Encoding]::UTF8.GetBytes('{"type":"hello","computerId":' + $WsState.compId + '}')
         $null = $ws.SendAsync([System.ArraySegment[byte]]::new($hello), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).GetAwaiter().GetResult()
 
         $script:WsConnected = $true
@@ -3180,6 +3392,8 @@ Start-WsListener
 Ensure-AuditPolicy
 $script:lastAuditCheck = Get-Date
 Apply-SigninMethod
+Get-SecuritySignals | Out-Null
+Push-SoftwareInventory
 
 try {
   while ($true) {
@@ -3205,6 +3419,7 @@ try {
       $user = Get-CurrentUser
       $av = Get-AvStatus
       $fw = Get-FirewallStatus
+      Get-SecuritySignals | Out-Null
 
       $hbBody = @{
         token = $config.token
@@ -3213,6 +3428,7 @@ try {
         agentVersion = $script:AgentVersion
         macAddress = Get-LocalMacAddress
         ipAddress = Get-LocalIpAddress
+        security = $script:SecuritySignalsCache
       }
       $hw = Get-HardwareFingerprint
       if ($hw.manufacturer) { $hbBody.manufacturer = $hw.manufacturer }
@@ -3248,6 +3464,11 @@ try {
       # ourselves in place so no reinstall is ever needed again.
       if ($hb.agentUpdateRequested -and $hb.latestAgentVersion) {
         Update-Self -LatestVersion ([string]$hb.latestAgentVersion)
+      }
+
+      # ---- software inventory (slow timer, not every heartbeat) -------------
+      if (((Get-Date) - $script:SoftwareInventorySentAt).TotalMinutes -ge 60) {
+        Push-SoftwareInventory
       }
 
       # ---- sign-in method (auto-login) --------------------------------------
@@ -3484,6 +3705,13 @@ try {
         Remove-Item -LiteralPath $ConfigPath -Force -ErrorAction SilentlyContinue
         $config = Register-Agent
         $ServerUrl = $config.serverUrl
+        # Keep the WS listener on the same server the heartbeat now uses, even
+        # if it had rotated (or was re-registered against a new deployment).
+        if ($script:WsState) {
+          $script:WsState.wsBase = ($ServerUrl -replace '^http', 'ws') + '/ws/tunnel'
+          $script:WsState.tokenEnc = [System.Uri]::EscapeDataString([string]$config.token)
+          $script:WsState.compId = [long]$config.computerId
+        }
       } else {
         Write-Log ('Heartbeat failed: {0}' -f $_.Exception.Message)
       }
