@@ -176,6 +176,9 @@ const TENANT_DDL_STATEMENTS = [
   ALTER TABLE lab_actions ADD COLUMN IF NOT EXISTS detail text;
   `,
   `
+  ALTER TABLE lab_actions ADD COLUMN IF NOT EXISTS actor text;
+  `,
+  `
   CREATE TABLE IF NOT EXISTS lab_alerts (
     id serial PRIMARY KEY,
     severity text NOT NULL,

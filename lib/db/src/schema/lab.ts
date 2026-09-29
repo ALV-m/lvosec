@@ -54,6 +54,9 @@ export const actionsTable = pgTable("lab_actions", {
   message: text("message"),
   payload: text("payload"),
   detail: text("detail"),
+  // Authenticated operator (or "agent:<computerId>") responsible for the action.
+  // Null on rows created before audit attribution shipped.
+  actor: text("actor"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

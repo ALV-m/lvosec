@@ -50,7 +50,7 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:AgentVersion = '1.18.0'
+$script:AgentVersion = '1.19.0'
 $ConfigDir = Join-Path $env:ProgramData 'LabCommandCenter'
 $ConfigPath = Join-Path $ConfigDir 'config.json'
 $PendingPath = Join-Path $ConfigDir 'pending\checkins.json'
@@ -2182,6 +2182,11 @@ function Receive-PushedFile {
   if (-not $Payload.fileId) { return @{ success = $false; detail = 'Missing fileId' } }
   $fileName = 'downloaded'
   if ($Payload.fileName) { $fileName = (Split-Path $Payload.fileName -Leaf) }
+  # A name from the server must never escape the destination directory.
+  $fileName = [System.IO.Path]::GetFileName($fileName)
+  if ([string]::IsNullOrWhiteSpace($fileName) -or $fileName -eq '.' -or $fileName -eq '..') {
+    return @{ success = $false; detail = 'Invalid file name' }
+  }
   $dest = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads'
   if ($Payload.destination) {
     $custom = [string]$Payload.destination
@@ -2190,6 +2195,10 @@ function Receive-PushedFile {
     } else {
       $dest = Join-Path $dest $custom
     }
+  }
+  if (-not (Test-AllowedWritePath -Path $dest)) {
+    Write-GateLog ('Blocked push outside allowed roots: {0}' -f $dest)
+    return @{ success = $false; detail = ('Refused: destination is outside the allowed file-operation roots: {0}' -f $dest) }
   }
   New-Item -ItemType Directory -Force -Path $dest | Out-Null
   $destPath = Join-Path $dest $fileName
@@ -2246,15 +2255,99 @@ function Get-DirListing {
   return @{ path = $Path; entries = $entries }
 }
 
+# --- File operation confinement ---------------------------------------------
+# `delete_file` and `push_file` act on a path supplied by whoever controls the
+# dashboard session (or, if a token ever leaks, whoever steals it). Destructive
+# operations are therefore confined to an allowlist of roots. Read-only
+# browsing stays unrestricted because it is a legitimate admin function and is
+# now behind authentication.
+#
+# `SYSTEM_DENY_ROOTS` is a hard block applied regardless of configuration, so a
+# misconfigured allowlist can never open up the OS.
+
+$script:SystemDenyRoots = @(
+  $env:SystemRoot,
+  (Join-Path $env:SystemRoot 'System32'),
+  (Join-Path $env:SystemRoot 'SysWOW64'),
+  (Join-Path $env:SystemRoot 'Boot'),
+  (Join-Path $env:SystemRoot 'Boot\System Partition'),
+  (Join-Path $env:SystemDrive 'Boot'),
+  (Join-Path $env:SystemDrive 'Recovery'),
+  (Join-Path $env:SystemDrive '$Recycle.Bin'),
+  (Join-Path $env:SystemDrive 'System Volume Information')
+) | Where-Object { $_ }
+
+# Roots a destructive file operation may touch. Defaults to the signed-in
+# user's own profile folders, which is where pushed files legitimately land.
+function Get-AllowedWriteRoots {
+  $roots = New-Object System.Collections.Generic.List[string]
+  $profile = [Environment]::GetFolderPath('UserProfile')
+  if ($profile) {
+    foreach ($folder in @('Desktop', 'Documents', 'Downloads', 'Pictures')) {
+      $p = Join-Path $profile $folder
+      if (Test-Path -LiteralPath $p) { $roots.Add($p) }
+    }
+    $roots.Add($profile)
+  }
+  $temp = [System.IO.Path]::GetTempPath()
+  if ($temp) { $roots.Add($temp) }
+  return $roots
+}
+
+# Returns $true when $Path is inside one of the allowed write roots and outside
+# every system deny root. Comparison is done on fully-resolved paths so `..`
+# segments and relative paths cannot escape the allowlist.
+function Test-AllowedWritePath {
+  param([string]$Path)
+  if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+  try {
+    $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
+  } catch {
+    # Not present yet (a push destination, for example). Fall back to the
+    # parent so the destination's directory is still checked.
+    try {
+      $parent = Split-Path -Parent $Path
+      if ([string]::IsNullOrWhiteSpace($parent)) { return $false }
+      $resolved = Join-Path (Resolve-Path -LiteralPath $parent -ErrorAction Stop).ProviderPath ([System.IO.Path]::GetFileName($Path))
+    } catch {
+      return $false
+    }
+  }
+  if (-not $resolved) { return $false }
+
+  $norm = $resolved.TrimEnd('\','/')
+  foreach ($deny in $script:SystemDenyRoots) {
+    $d = $deny.TrimEnd('\','/')
+    if ($norm -eq $d -or $norm.StartsWith($d + '\', 'OrdinalIgnoreCase') -or $norm.StartsWith($d + '/', 'OrdinalIgnoreCase')) {
+      return $false
+    }
+  }
+  foreach ($root in (Get-AllowedWriteRoots)) {
+    $r = $root.TrimEnd('\','/')
+    if ($norm -eq $r -or $norm.StartsWith($r + '\', 'OrdinalIgnoreCase') -or $norm.StartsWith($r + '/', 'OrdinalIgnoreCase')) {
+      return $true
+    }
+  }
+  return $false
+}
+
 function Remove-TargetFile {
   param($Payload)
   if (-not $Payload.path) { return @{ success = $false; detail = 'No path provided' } }
-  $target = $Payload.path
-  if (Test-Path -LiteralPath $target) {
-    Remove-Item -LiteralPath $target -Force -Recurse -ErrorAction Stop
-    return @{ success = $true; detail = ('Deleted {0}' -f $target) }
+  $target = [string]$Payload.path
+  if (-not (Test-Path -LiteralPath $target)) {
+    return @{ success = $false; detail = ('Path not found: {0}' -f $target) }
   }
-  return @{ success = $false; detail = ('Path not found: {0}' -f $target) }
+  if (-not (Test-AllowedWritePath -Path $target)) {
+    Write-GateLog ('Blocked delete outside allowed roots: {0}' -f $target)
+    try {
+      $body = @{ token = $config.token; type = 'file_op_blocked'; message = ('Blocked delete outside allowed roots on {0}' -f $env:COMPUTERNAME); detail = $target }
+      Invoke-ApiJson -Method 'POST' -Path '/api/agent/events' -Body $body | Out-Null
+    } catch {}
+    return @{ success = $false; detail = ('Refused: path is outside the allowed file-operation roots: {0}' -f $target) }
+  }
+  Remove-Item -LiteralPath $target -Force -Recurse -ErrorAction Stop
+  return @{ success = $true; detail = ('Deleted {0}' -f $target) }
 }
 
 function Invoke-SyncScan {
