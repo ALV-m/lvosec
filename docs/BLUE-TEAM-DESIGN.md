@@ -19,7 +19,7 @@
 > coverage honestly instead of persisting stale pass/fail.
 
 Status: **shipping, phased — see the table above**
-Target repo: `ALV-m/lab-command-center` → `ALV-m/lvosec`
+Target repo: `ALV-m/lvosec` (renamed from `ALV-m/lab-command-center`)
 
 ---
 
