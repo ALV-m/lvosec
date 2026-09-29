@@ -21,7 +21,12 @@ services:
     runtime: node
     plan: free
     rootDir: .
-    buildCommand: corepack enable && corepack prepare pnpm@11.11.0 --activate && pnpm install && pnpm run db:setup && pnpm run build
+    # No db:setup here on purpose: Render build instances cannot resolve the
+    # internal Postgres hostname (private network), so a build-time DB step
+    # fails on every deploy. The server ensures schema + platform admin at
+    # startup inside the private network instead (idempotent), and the seed
+    # step is only needed for a brand-new database.
+    buildCommand: corepack enable && corepack prepare pnpm@11.11.0 --activate && pnpm install && pnpm run build
     startCommand: node artifacts/api-server/dist/index.mjs
     healthCheckPath: /api/healthz
     autoDeploy: true
