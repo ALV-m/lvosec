@@ -204,3 +204,42 @@ export const searchBlueTeamRecords = async (
     method: "GET",
   });
 };
+
+export interface SoftwareEntry {
+  name: string;
+  version?: string | null;
+  publisher?: string | null;
+}
+
+export interface SoftwareInventoryResponse {
+  machines: number;
+  totalEntries: number;
+  inventories: Array<{
+    computerId: number;
+    computerName: string;
+    room: string;
+    software: SoftwareEntry[];
+  }>;
+}
+
+export const getBlueTeamSoftwareUrl = (): string => "/api/blue-team/software";
+
+export const getBlueTeamSoftware = async (
+  options?: Parameters<typeof customFetch>[1],
+): Promise<SoftwareInventoryResponse> => {
+  return customFetch<SoftwareInventoryResponse>(getBlueTeamSoftwareUrl(), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getBlueTeamSoftwareQueryKey = () => ["/api/blue-team/software"] as const;
+
+export function useGetBlueTeamSoftware(
+  options?: { request?: SecondParameter<typeof customFetch> },
+) {
+  const queryKey = getBlueTeamSoftwareQueryKey();
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof getBlueTeamSoftware>>> = ({ signal }) =>
+    getBlueTeamSoftware({ signal, ...options?.request });
+  return useQuery({ queryKey, queryFn });
+}

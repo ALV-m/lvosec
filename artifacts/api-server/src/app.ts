@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import router, { tenantRouter } from "./routes";
 import { logger } from "./lib/logger";
+import { wafMiddleware } from "./lib/waf";
 
 const app: Express = express();
 
@@ -67,6 +68,41 @@ app.use(cookieParser());
 // which is fine but unintentional — and screenshots/file pushes are the
 // legitimate large payloads, so keep JSON modest and allow the body parser a
 // clear ceiling rather than an accidental one.
+// ---------------------------------------------------------------------------
+// WAF-lite
+// ---------------------------------------------------------------------------
+// Application-layer perimeter controls: abusive methods, vulnerability
+// scanner user-agents, and the paths scanners always try first. Optional
+// Cloudflare country allowlist via WAF_ALLOW_COUNTRIES (e.g. "KE,US,GB") —
+// only engaged when explicitly configured, because geofencing without a
+// trusted country header would lock the whole lab out.
+//
+// Mounted BEFORE body parsing so a blocked request never pays the parse cost.
+// ---------------------------------------------------------------------------
+app.use(
+  wafMiddleware({
+    allowCountries: (process.env.WAF_ALLOW_COUNTRIES ?? "")
+      .split(",")
+      .map((c) => c.trim().toUpperCase())
+      .filter(Boolean),
+    enforce: process.env.WAF_ENFORCE !== "off",
+    logBlock: (decision, ctx) => {
+      logger.warn(
+        {
+          waf: decision.action,
+          why: decision.reason,
+          status: "status" in decision ? decision.status : undefined,
+          method: ctx.method,
+          path: ctx.path,
+          ua: String(ctx.userAgent ?? "").slice(0, 160),
+          country: ctx.country ?? null,
+        },
+        "waf:request-{waf}",
+      );
+    },
+  }),
+);
+
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 

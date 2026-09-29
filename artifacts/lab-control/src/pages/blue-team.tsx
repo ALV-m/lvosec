@@ -5,6 +5,7 @@ import {
   type PostureSeverity,
   type PostureState,
   useGetBlueTeamPosture,
+  useGetBlueTeamSoftware,
   searchBlueTeamRecords,
 } from "@workspace/api-client-react";
 import {
@@ -371,7 +372,94 @@ export default function BlueTeam() {
           </Table>
         </CardContent>
       </Card>
+
+      {/* Software inventory */}
+      <SoftwareInventory />
     </div>
+  );
+}
+
+function SoftwareInventory() {
+  const inventory = useGetBlueTeamSoftware();
+  const data = inventory.data;
+  const [filter, setFilter] = useState("");
+
+  const lower = filter.trim().toLowerCase();
+  const matches = !data
+    ? []
+    : data.inventories.flatMap((machine) =>
+        machine.software
+          .filter((s) => !lower || s.name.toLowerCase().includes(lower))
+          .map((s) => ({ ...s, computerName: machine.computerName, room: machine.room })),
+      );
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Software inventory</CardTitle>
+        <CardDescription>
+          What is installed where. Search to answer the question the whole lab
+          depends on: <em>which machines have this?</em>
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3 px-6">
+        <div className="flex gap-2">
+          <div className="relative flex-1">
+            <Search className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              className="pl-9"
+              placeholder="Filter by software name, e.g. WinRAR, Python, Zoom…"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+          </div>
+        </div>
+
+        {inventory.isLoading ? (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Spinner className="size-4" /> Loading inventory…
+          </div>
+        ) : !data || data.machines === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No machine has reported an inventory yet. Agents older than 1.22.0
+            do not send one — they pick it up when they self-update.
+          </p>
+        ) : (
+          <>
+            <p className="text-xs text-muted-foreground">
+              {data.machines} machine{data.machines === 1 ? "" : "s"} · {data.totalEntries} programs
+              {lower ? ` · ${matches.length} match${matches.length === 1 ? "" : "es"} for “${filter.trim()}”` : ""}
+            </p>
+            {matches.length > 0 ? (
+              <div className="max-h-96 overflow-y-auto border rounded-lg">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Software</TableHead>
+                      <TableHead>Version</TableHead>
+                      <TableHead>Machine</TableHead>
+                      <TableHead>Room</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {matches.slice(0, 200).map((m, i) => (
+                      <TableRow key={`${m.computerName}-${i}`}>
+                        <TableCell className="font-medium">{m.name}</TableCell>
+                        <TableCell className="text-muted-foreground">{m.version ?? "—"}</TableCell>
+                        <TableCell>{m.computerName}</TableCell>
+                        <TableCell className="text-muted-foreground">{m.room}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">Nothing matches that filter.</p>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

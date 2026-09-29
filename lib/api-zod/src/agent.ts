@@ -174,6 +174,18 @@ export const AgentEventResponse = zod.object({
   ok: zod.boolean(),
 });
 
+export const SoftwareEntry = zod.object({
+  name: zod.string().min(1).max(256),
+  version: zod.string().max(128).nullish(),
+  publisher: zod.string().max(256).nullish(),
+});
+
+export const AgentSoftwareBody = zod.object({
+  token: zod.string().min(1),
+  /** Full installed-software snapshot, deduplicated, sorted. */
+  software: zod.array(SoftwareEntry).max(600),
+});
+
 export const AgentCheckinRole = zod.enum(["student", "teacher", "visitor", "admin"]);
 
 export const AgentCheckinBody = zod
@@ -220,4 +232,8 @@ export const AgentUploadResponse = zod.object({
 export const AgentScreenshotResponse = zod.object({
   fileId: zod.string(),
   takenAt: zod.string(),
+});
+
+export const AgentSoftwareResponse = zod.object({
+  ok: zod.boolean(),
 });

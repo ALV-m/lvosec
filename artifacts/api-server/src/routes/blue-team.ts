@@ -176,6 +176,34 @@ router.get("/blue-team/posture/:computerId", async (req, res) => {
 });
 
 /**
+ * Software inventory across every machine that has reported one. The client
+ * does the searching; the server just hands over what it has. Empty list when
+ * nothing has reported yet (agents below 1.22.0 do not send inventories).
+ */
+router.get("/blue-team/software", async (_req, res) => {
+  const computers = await db
+    .select({ id: computersTable.id, name: computersTable.name, room: computersTable.room, installedSoftware: computersTable.installedSoftware })
+    .from(computersTable);
+
+  const inventories: Array<{
+    computerId: number;
+    computerName: string;
+    room: string;
+    software: Array<{ name: string; version?: string | null; publisher?: string | null }>;
+  }> = [];
+  let totalEntries = 0;
+
+  for (const c of computers) {
+    const software = Array.isArray(c.installedSoftware) ? c.installedSoftware : [];
+    if (software.length === 0) continue;
+    inventories.push({ computerId: c.id, computerName: c.name, room: c.room, software });
+    totalEntries += software.length;
+  }
+
+  res.json({ machines: inventories.length, totalEntries, inventories });
+});
+
+/**
  * IOC / record search across everything the lab has logged. This is the honest
  * local SOC search: it looks at the events, actions, alerts and check-ins that
  * already exist in this tenant's schema, because that is what this server can
@@ -270,7 +298,7 @@ router.get("/blue-team/search", async (req, res) => {
       kind: "action" as const,
       id: r.id as number | string,
       title: r.action,
-      detail: r.message ?? "" + (r.actor ? ` · by ${r.actor}` : ""),
+      detail: (r.message ?? "") + (r.actor ? ` · by ${r.actor}` : ""),
       severity: null,
       computerName: null,
       createdAt: r.createdAt,

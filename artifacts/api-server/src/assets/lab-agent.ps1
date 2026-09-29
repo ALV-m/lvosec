@@ -52,7 +52,7 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:AgentVersion = '1.21.0'
+$script:AgentVersion = '1.22.0'
 
 # Storage identity. Renamed from LabCommandCenter to LvOsSec. Because this
 # directory holds config.json (which carries the agent token), the old one
@@ -422,6 +422,58 @@ function Get-SecuritySignals {
 
   $script:SecuritySignalsCache = $s
   return $s
+}
+
+# ---------------------------------------------------------------------------
+# Installed-software inventory
+# ---------------------------------------------------------------------------
+# Registry Uninstall keys are the one source that exists on every Windows
+# build and works as SYSTEM without extra modules. Sent to the server on a
+# one-hour timer, never on the 10-second heartbeat.
+
+$script:SoftwareInventoryCache = $null
+$script:SoftwareInventorySentAt = (Get-Date).AddHours(-2)
+
+function Get-SoftwareInventory {
+  if ($script:SoftwareInventoryCache) { return $script:SoftwareInventoryCache }
+  $seen = @{}
+  $list = @()
+  $roots = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )
+  foreach ($root in $roots) {
+    try {
+      $keys = @(Get-ItemProperty -LiteralPath $root -ErrorAction Stop)
+      foreach ($entry in $keys) {
+        if (-not $entry.PSChildName -or -not $entry.DisplayName) { continue }
+        # System components and updates are uninteresting to an inventory.
+        if ($entry.PSChildName -like 'KB*' -or $entry.SystemComponent -eq 1) { continue }
+        $name = ([string]$entry.DisplayName).Trim()
+        if (-not $name -or $seen.ContainsKey($name.ToLowerInvariant())) { continue }
+        $seen[$name.ToLowerInvariant()] = $true
+        $item = @{ name = $name }
+        if ($entry.DisplayVersion) { $item.version = [string]$entry.DisplayVersion }
+        if ($entry.Publisher) { $item.publisher = [string]$entry.Publisher }
+        $list += $item
+      }
+    } catch {}
+  }
+  $script:SoftwareInventoryCache = @($list | Sort-Object name)
+  return $script:SoftwareInventoryCache
+}
+
+function Push-SoftwareInventory {
+  try {
+    $sw = Get-SoftwareInventory
+    if (-not $sw) { return }
+    $config = Get-Config
+    $body = @{ token = $config.token; software = $sw }
+    $json = $body | ConvertTo-Json -Compress -Depth 4
+    Invoke-RestMethod -Uri ('{0}/api/agent/software' -f $ServerUrl) -Method Post -ContentType 'application/json' -Body $json -TimeoutSec 60 | Out-Null
+    $script:SoftwareInventorySentAt = Get-Date
+  } catch {}
 }
 
 function Get-Peripherals {
@@ -3290,6 +3342,8 @@ Start-WsListener
 Ensure-AuditPolicy
 $script:lastAuditCheck = Get-Date
 Apply-SigninMethod
+Get-SecuritySignals | Out-Null
+Push-SoftwareInventory
 
 try {
   while ($true) {
@@ -3360,6 +3414,11 @@ try {
       # ourselves in place so no reinstall is ever needed again.
       if ($hb.agentUpdateRequested -and $hb.latestAgentVersion) {
         Update-Self -LatestVersion ([string]$hb.latestAgentVersion)
+      }
+
+      # ---- software inventory (slow timer, not every heartbeat) -------------
+      if (((Get-Date) - $script:SoftwareInventorySentAt).TotalMinutes -ge 60) {
+        Push-SoftwareInventory
       }
 
       # ---- sign-in method (auto-login) --------------------------------------
