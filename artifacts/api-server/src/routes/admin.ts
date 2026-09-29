@@ -1,9 +1,12 @@
 import { Router, type IRouter } from "express";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import {
   db,
+  platformDbConnectionsTable,
   platformUsersTable,
   tenantsTable,
+  testDbConnection,
+  writePlatformSnapshot,
 } from "@workspace/db";
 import {
   AdminAccount,
@@ -12,11 +15,19 @@ import {
   AdminMeResponse,
   AdminLogoutResponse,
   AdminOpenLabResponse,
+  DbConnectionCreateBody,
+  DbConnectionIdParams,
+  DbConnectionSnapshotResponse,
+  DbConnectionTestResponse,
+  DbConnectionUpdateBody,
+  DbConnectionsListResponse,
   PlatformStatsResponse,
   TenantAdminPasswordBody,
   TenantIdParams,
   TenantsListResponse,
   TenantStatusUpdateBody,
+  type DbConnectionStatus,
+  type PlatformDbConnection,
   type TenantListItem,
 } from "@workspace/api-zod";
 import {
@@ -290,5 +301,245 @@ router.delete("/admin/tenants/:tenantId", async (req, res): Promise<void> => {
   logger.info({ tenantId: existing.id }, "Tenant deleted");
   res.json({ ok: true });
 });
+
+// ---------------------------------------------------------------------------
+// DB Management — registry of Postgres URLs the admin inputs and manages under
+// one dashboard. The admin marks one connection as active (the DB their sites
+// should use — the dashboard provides the URL to copy), health-checks any
+// connection, and pushes a manual platform snapshot to a chosen target.
+// ---------------------------------------------------------------------------
+
+const mapDbConnection = (
+  row: typeof platformDbConnectionsTable.$inferSelect,
+): PlatformDbConnection => ({
+  id: row.id,
+  name: row.name,
+  url: row.url,
+  note: row.note,
+  isActive: row.isActive,
+  status: row.status as DbConnectionStatus,
+  lastCheckedAt: row.lastCheckedAt
+    ? new Date(row.lastCheckedAt).toISOString()
+    : null,
+  lastError: row.lastError,
+  createdAt: new Date(row.createdAt).toISOString(),
+});
+
+router.get("/admin/databases", async (_req, res): Promise<void> => {
+  const rows = await db
+    .select()
+    .from(platformDbConnectionsTable)
+    .orderBy(asc(platformDbConnectionsTable.id));
+  res.json(
+    DbConnectionsListResponse.parse({ connections: rows.map(mapDbConnection) }),
+  );
+});
+
+router.post("/admin/databases", async (req, res): Promise<void> => {
+  const body = DbConnectionCreateBody.safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: "Invalid connection details" });
+    return;
+  }
+  const [row] = await db
+    .insert(platformDbConnectionsTable)
+    .values({
+      name: body.data.name,
+      url: body.data.url,
+      note: body.data.note ?? null,
+    })
+    .returning();
+  res.status(201).json(mapDbConnection(row));
+});
+
+router.patch("/admin/databases/:id", async (req, res): Promise<void> => {
+  const params = DbConnectionIdParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: "Invalid connection id" });
+    return;
+  }
+  const body = DbConnectionUpdateBody.safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: "Invalid connection update" });
+    return;
+  }
+
+  const [existing] = await db
+    .select()
+    .from(platformDbConnectionsTable)
+    .where(eq(platformDbConnectionsTable.id, params.data.id))
+    .limit(1);
+  if (!existing) {
+    res.status(404).json({ error: "Connection not found" });
+    return;
+  }
+
+  // Only one connection can be the active (in-use) database at a time.
+  if (body.data.isActive === true) {
+    await db
+      .update(platformDbConnectionsTable)
+      .set({ isActive: false })
+      .where(eq(platformDbConnectionsTable.isActive, true));
+  }
+
+  const set: Partial<typeof platformDbConnectionsTable.$inferInsert> = {};
+  if (body.data.name !== undefined) set.name = body.data.name;
+  if (body.data.url !== undefined) set.url = body.data.url;
+  if (body.data.note !== undefined) set.note = body.data.note;
+  if (body.data.isActive !== undefined) set.isActive = body.data.isActive;
+  if (Object.keys(set).length > 0) {
+    await db
+      .update(platformDbConnectionsTable)
+      .set(set)
+      .where(eq(platformDbConnectionsTable.id, existing.id));
+  }
+
+  const [updated] = await db
+    .select()
+    .from(platformDbConnectionsTable)
+    .where(eq(platformDbConnectionsTable.id, existing.id))
+    .limit(1);
+  res.json(mapDbConnection(updated));
+});
+
+router.delete("/admin/databases/:id", async (req, res): Promise<void> => {
+  const params = DbConnectionIdParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: "Invalid connection id" });
+    return;
+  }
+  const [existing] = await db
+    .select()
+    .from(platformDbConnectionsTable)
+    .where(eq(platformDbConnectionsTable.id, params.data.id))
+    .limit(1);
+  if (!existing) {
+    res.status(404).json({ error: "Connection not found" });
+    return;
+  }
+  await db
+    .delete(platformDbConnectionsTable)
+    .where(eq(platformDbConnectionsTable.id, existing.id));
+  res.json({ ok: true });
+});
+
+router.post("/admin/databases/:id/test", async (req, res): Promise<void> => {
+  const params = DbConnectionIdParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: "Invalid connection id" });
+    return;
+  }
+  const [existing] = await db
+    .select()
+    .from(platformDbConnectionsTable)
+    .where(eq(platformDbConnectionsTable.id, params.data.id))
+    .limit(1);
+  if (!existing) {
+    res.status(404).json({ error: "Connection not found" });
+    return;
+  }
+
+  const result = await testDbConnection(existing.url);
+  await db
+    .update(platformDbConnectionsTable)
+    .set({
+      status: result.ok ? "ok" : "error",
+      lastCheckedAt: new Date(),
+      lastError: result.error,
+    })
+    .where(eq(platformDbConnectionsTable.id, existing.id));
+
+  res.json(
+    DbConnectionTestResponse.parse({
+      ok: result.ok,
+      latencyMs: result.latencyMs,
+      error: result.error,
+    }),
+  );
+});
+
+async function buildPlatformSnapshot(takenAt: string) {
+  const tenants = await db
+    .select()
+    .from(tenantsTable)
+    .orderBy(asc(tenantsTable.id));
+  const tenantRows = [];
+  for (const tenant of tenants) {
+    const [computers, admins] = await Promise.all([
+      countTenantComputers(tenant.id),
+      countTenantAdmins(tenant.id),
+    ]);
+    tenantRows.push({
+      id: tenant.id,
+      name: tenant.name,
+      slug: tenant.slug,
+      status: tenant.status,
+      computers,
+      admins,
+    });
+  }
+  const stats = tenants.reduce(
+    (acc, t) => {
+      acc.total += 1;
+      if (t.status === "active") acc.active += 1;
+      if (t.status === "suspended") acc.suspended += 1;
+      return acc;
+    },
+    { total: 0, active: 0, suspended: 0 },
+  );
+  return {
+    takenAt,
+    source: "lvosec",
+    platform: {
+      totalTenants: stats.total,
+      activeTenants: stats.active,
+      suspendedTenants: stats.suspended,
+      totalComputers: tenantRows.reduce((n, t) => n + t.computers, 0),
+      totalAdmins: tenantRows.reduce((n, t) => n + t.admins, 0),
+    },
+    tenants: tenantRows,
+  };
+}
+
+router.post(
+  "/admin/databases/:id/push-snapshot",
+  async (req, res): Promise<void> => {
+    const params = DbConnectionIdParams.safeParse(req.params);
+    if (!params.success) {
+      res.status(400).json({ error: "Invalid connection id" });
+      return;
+    }
+    const [existing] = await db
+      .select()
+      .from(platformDbConnectionsTable)
+      .where(eq(platformDbConnectionsTable.id, params.data.id))
+      .limit(1);
+    if (!existing) {
+      res.status(404).json({ error: "Connection not found" });
+      return;
+    }
+
+    const takenAt = new Date().toISOString();
+    const payload = await buildPlatformSnapshot(takenAt);
+    const result = await writePlatformSnapshot(existing.url, payload);
+
+    await db
+      .update(platformDbConnectionsTable)
+      .set({
+        status: result.ok ? "ok" : "error",
+        lastCheckedAt: new Date(),
+        lastError: result.error,
+      })
+      .where(eq(platformDbConnectionsTable.id, existing.id));
+
+    if (!result.ok) {
+      res.status(502).json({ error: result.error ?? "Snapshot push failed" });
+      return;
+    }
+    res.json(
+      DbConnectionSnapshotResponse.parse({ ok: true, rows: result.rows, takenAt }),
+    );
+  },
+);
 
 export default router;
