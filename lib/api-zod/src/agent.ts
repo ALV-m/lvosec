@@ -72,6 +72,38 @@ export const AgentHeartbeatBody = zod.object({
   cpuCores: zod.number().nullish(),
   diskTotal: zod.number().nullish(),
   diskFree: zod.number().nullish(),
+  /**
+   * Security posture signals consumed by the posture engine. Tri-state: a
+   * missing member means \"not reported\", which the engine reports as
+   * `unknown` rather than `pass`. The agent sends its full cached snapshot
+   * with every heartbeat; the server stores it wholesale in
+   * lab_computers.security_signals.
+   */
+  security: zod
+    .object({
+      avRealtimeProtection: zod.boolean().nullish(),
+      avTamperProtection: zod.boolean().nullish(),
+      /** Count of paths excluded from AV scanning. */
+      avExclusionCount: zod.number().nullish(),
+      avSignatureAgeDays: zod.number().nullish(),
+      avDisabledByPolicy: zod.boolean().nullish(),
+      firewallAllProfiles: zod.boolean().nullish(),
+      smb1Enabled: zod.boolean().nullish(),
+      smbSigningRequired: zod.boolean().nullish(),
+      rdpEnabled: zod.boolean().nullish(),
+      bitlockerEnabled: zod.boolean().nullish(),
+      tpmPresent: zod.boolean().nullish(),
+      secureBootEnabled: zod.boolean().nullish(),
+      uacEnabled: zod.boolean().nullish(),
+      guestAccountEnabled: zod.boolean().nullish(),
+      screenLockEnabled: zod.boolean().nullish(),
+      autorunEnabled: zod.boolean().nullish(),
+      windowsUpdateDisabled: zod.boolean().nullish(),
+      localAdminCount: zod.number().nullish(),
+      /** Winlogon AutoAdminLogon state, compared against the sign-in method. */
+      autoLogonEnabled: zod.boolean().nullish(),
+    })
+    .nullish(),
 });
 
 export const AgentPendingAction = zod.object({

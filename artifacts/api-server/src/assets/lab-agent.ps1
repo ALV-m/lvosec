@@ -52,7 +52,7 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:AgentVersion = '1.20.0'
+$script:AgentVersion = '1.21.0'
 
 # Storage identity. Renamed from LabCommandCenter to LvOsSec. Because this
 # directory holds config.json (which carries the agent token), the old one
@@ -312,6 +312,116 @@ function Get-FirewallStatus {
     }
   } catch {}
   return $result
+}
+
+# ---------------------------------------------------------------------------
+# Security posture signals
+# ---------------------------------------------------------------------------
+# A snapshot of cheap, read-only checks consumed by the server's posture engine
+# (blue-team/posture.ts). The engine treats a missing member as "unknown",
+# never as "pass", so a check that cannot run on a given machine simply leaves
+# that key absent -- it never turns a blind spot into a clean bill of health.
+#
+# The expensive checks (BitLocker, TPM, Secure Boot, local admins) refresh on a
+# 5-minute timer; the rest are registry reads that run every refresh too. The
+# heartbeat attaches the cached snapshot to every request, so the server always
+# sees the full picture without the 10-second loop paying for the cost.
+# ---------------------------------------------------------------------------
+
+$script:SecuritySignalsCache = $null
+$script:SecuritySignalsCacheAt = (Get-Date).AddMinutes(-10)
+
+function Read-RegDword {
+  param([string]$Path, [string]$Name, [int]$Default = $null)
+  try {
+    $v = (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name
+    return [int]$v
+  } catch { return $Default }
+}
+
+function Get-SecuritySignals {
+  # Refresh at most every five minutes.
+  $elapsed = (Get-Date) - $script:SecuritySignalsCacheAt
+  if ($script:SecuritySignalsCache -and $elapsed.TotalMinutes -lt 5) {
+    return $script:SecuritySignalsCache
+  }
+  $script:SecuritySignalsCacheAt = Get-Date
+
+  $s = @{}
+
+  # --- Defender -------------------------------------------------------------
+  try {
+    $pref = Get-MpPreference -ErrorAction Stop
+    $mp = Get-MpComputerStatus -ErrorAction Stop
+    $s.avRealtimeProtection = -not [bool]$pref.DisableRealtimeMonitoring
+    $s.avTamperProtection = [bool]$mp.IsTamperProtected
+    $excl = @($pref.ExclusionPath) + @($pref.ExclusionExtension) + @($pref.ExclusionProcess)
+    $s.avExclusionCount = @($excl | Where-Object { $_ }).Count
+    if ($mp.AntivirusSignatureLastUpdated) {
+      $s.avSignatureAgeDays = [int]([Math]::Floor(((Get-Date) - $mp.AntivirusSignatureLastUpdated.ToLocalTime()).TotalDays))
+      if ($s.avSignatureAgeDays -lt 0) { $s.avSignatureAgeDays = 0 }
+    }
+    # A policy entry that disables the product is different from a student
+    # turning it off locally -- it means something is forcing it back off.
+    $policyRealtime = Read-RegDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' 'DisableRealtimeMonitoring' 0
+    $policyAntiSpy = Read-RegDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' 'DisableAntiSpyware' 0
+    $s.avDisabledByPolicy = ($policyRealtime -eq 1) -or ($policyAntiSpy -eq 1)
+  } catch {}
+
+  # --- Firewall -------------------------------------------------------------
+  try {
+    $fw = @(Get-NetFirewallProfile -ErrorAction Stop)
+    $s.firewallAllProfiles = ($fw.Count -gt 0) -and (@($fw | Where-Object { $_.Enabled -ne $true }).Count -eq 0)
+  } catch {}
+
+  # --- SMB / network --------------------------------------------------------
+  $smb1 = Read-RegDword 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1' 0
+  if ($smb1 -ne $null) { $s.smb1Enabled = ($smb1 -eq 1) }
+  $smbSigning = Read-RegDword 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'RequireSecuritySignature' 0
+  if ($smbSigning -ne $null) { $s.smbSigningRequired = ($smbSigning -eq 1) }
+  $rdpDeny = Read-RegDword 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' $null
+  if ($rdpDeny -ne $null) { $s.rdpEnabled = ($rdpDeny -eq 0) }
+
+  # --- Encryption / hardware ------------------------------------------------
+  try {
+    $vol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
+    $s.bitlockerEnabled = ($vol.ProtectionStatus -eq 'On')
+  } catch {}
+  try {
+    $tpm = Get-Tpm -ErrorAction Stop
+    $s.tpmPresent = [bool]$tpm.TpmPresent
+  } catch {}
+  try {
+    $s.secureBootEnabled = [bool](Confirm-SecureBootUEFI)
+  } catch {
+    # Non-UEFI machines throw here; Secure Boot genuinely cannot be evaluated.
+    $s.secureBootEnabled = $null
+  }
+
+  # --- OS configuration -----------------------------------------------------
+  $uac = Read-RegDword 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'EnableLUA' 1
+  $s.uacEnabled = ($uac -eq 1)
+  $noLockScreen = Read-RegDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization' 'NoLockScreen' 0
+  $s.screenLockEnabled = -not [bool]$noLockScreen
+  $noAutoRun = Read-RegDword 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'NoDriveTypeAutoRun' 0
+  $s.autorunEnabled = (($noAutoRun -band 0xFF) -eq 0)
+  $auPolicy = Read-RegDword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoUpdate' 0
+  $auCurrent = Read-RegDword 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update' 'NoAutoUpdate' 0
+  $s.windowsUpdateDisabled = ([bool]$auPolicy) -or ([bool]$auCurrent)
+  $autoLogon = try { [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction Stop).AutoAdminLogon } catch { '' }
+  $s.autoLogonEnabled = ($autoLogon -eq '1')
+
+  try {
+    $guest = Get-LocalUser -Name 'Guest' -ErrorAction Stop
+    $s.guestAccountEnabled = [bool]$guest.Enabled
+  } catch {}
+  try {
+    $admins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop)
+    $s.localAdminCount = $admins.Count
+  } catch {}
+
+  $script:SecuritySignalsCache = $s
+  return $s
 }
 
 function Get-Peripherals {
@@ -3205,6 +3315,7 @@ try {
       $user = Get-CurrentUser
       $av = Get-AvStatus
       $fw = Get-FirewallStatus
+      Get-SecuritySignals | Out-Null
 
       $hbBody = @{
         token = $config.token
@@ -3213,6 +3324,7 @@ try {
         agentVersion = $script:AgentVersion
         macAddress = Get-LocalMacAddress
         ipAddress = Get-LocalIpAddress
+        security = $script:SecuritySignalsCache
       }
       $hw = Get-HardwareFingerprint
       if ($hw.manufacturer) { $hbBody.manufacturer = $hw.manufacturer }

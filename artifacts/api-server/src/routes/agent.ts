@@ -257,6 +257,10 @@ router.post("/agent/heartbeat", async (req, res): Promise<void> => {
       cpuCores: body.data.cpuCores ?? computer.cpuCores,
       diskTotal: body.data.diskTotal ?? computer.diskTotal,
       diskFree: body.data.diskFree ?? computer.diskFree,
+      // The agent sends its full security snapshot with every heartbeat, so
+      // store it wholesale. Old agents never send it and leave the last value
+      // in place, which is the correct stale-but-known outcome.
+      securitySignals: body.data.security ?? computer.securitySignals,
     })
     .where(eq(computersTable.id, computer.id));
 

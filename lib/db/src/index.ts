@@ -157,6 +157,7 @@ const TENANT_DDL_STATEMENTS = [
   ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS cpu_cores integer;
   ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS disk_total bigint;
   ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS disk_free bigint;
+  ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS security_signals jsonb;
   `,
   `
   CREATE TABLE IF NOT EXISTS lab_actions (
