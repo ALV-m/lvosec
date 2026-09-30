@@ -243,3 +243,45 @@ export function useGetBlueTeamSoftware(
     getBlueTeamSoftware({ signal, ...options?.request });
   return useQuery({ queryKey, queryFn });
 }
+
+// Defense Stack — live status of every defensive layer (perimeter/WAF,
+// detection, hosts, assets, databases, data) mapped 1:1 to the SOC blueprint.
+
+export type DefenseLayerState = "active" | "warning" | "off" | "na";
+
+export interface DefenseLayer {
+  id: string;
+  label: string;
+  state: DefenseLayerState;
+  detail: string;
+  count: number | null;
+}
+
+export interface DefenseStackResponse {
+  layers: DefenseLayer[];
+  lab: { computers: number; failing: number };
+  findings: number;
+}
+
+export const getBlueTeamDefenseStackUrl = (): string => "/api/blue-team/defense-stack";
+
+export const getBlueTeamDefenseStack = async (
+  options?: Parameters<typeof customFetch>[1],
+): Promise<DefenseStackResponse> => {
+  return customFetch<DefenseStackResponse>(getBlueTeamDefenseStackUrl(), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getBlueTeamDefenseStackQueryKey = () =>
+  ["/api/blue-team/defense-stack"] as const;
+
+export function useGetBlueTeamDefenseStack(
+  options?: { request?: SecondParameter<typeof customFetch> },
+) {
+  const queryKey = getBlueTeamDefenseStackQueryKey();
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof getBlueTeamDefenseStack>>> = ({ signal }) =>
+    getBlueTeamDefenseStack({ signal, ...options?.request });
+  return useQuery({ queryKey, queryFn });
+}

@@ -2,7 +2,7 @@ import { Router, type IRouter } from "express";
 import express from "express";
 import { and, eq, sql } from "drizzle-orm";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,25 +41,14 @@ import {
   ReportFileListingBody,
 } from "@workspace/api-zod";
 import { broadcastFrame } from "../lib/tunnel";
+import { bundledAgentVersion } from "../lib/agent-version";
 
 const router: IRouter = Router();
 
 const DIST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(DIST_DIR, "data", "uploads");
 const AGENT_SCRIPT_PATH = path.join(DIST_DIR, "lab-agent.ps1");
-
-// The version of the agent script bundled with this build. Advertised in every
-// heartbeat so agents that are older can download the new script and update
-// themselves in place, without a manual reinstall.
-const bundledAgentVersion = (() => {
-  try {
-    const source = readFileSync(AGENT_SCRIPT_PATH, "utf8");
-    const match = source.match(/\$script:AgentVersion\s*=\s*'([^']+)'/);
-    return match ? match[1] : null;
-  } catch {
-    return null;
-  }
-})();
+const AGENT_LINUX_SCRIPT_PATH = path.join(DIST_DIR, "lab-agent-linux.py");
 
 await mkdir(UPLOADS_DIR, { recursive: true });
 
@@ -388,13 +377,14 @@ router.post("/agent/heartbeat", async (req, res): Promise<void> => {
     autoShared = { user, password };
   }
 
+  const latest = bundledAgentVersion();
+
   res.json(
     AgentHeartbeatResponse.parse({
       serverTime: new Date().toISOString(),
-      latestAgentVersion: bundledAgentVersion,
+      latestAgentVersion: latest,
       agentUpdateRequested:
-        bundledAgentVersion !== null &&
-        bundledAgentVersion !== (computer.agentVersion ?? null),
+        latest !== null && latest !== (computer.agentVersion ?? null),
       computer: {
         id: computer.id,
         name: computer.name,
@@ -1011,6 +1001,16 @@ router.get("/agent/download", (_req, res): void => {
     return;
   }
   res.download(AGENT_SCRIPT_PATH, "lab-agent.ps1");
+});
+
+// Linux agent (Ubuntu/Debian VPSes — Contabo & co) — same protocol, same
+// dashboard. Served so a VPS can install with a one-liner.
+router.get("/agent/download-linux", (_req, res): void => {
+  if (!existsSync(AGENT_LINUX_SCRIPT_PATH)) {
+    res.status(404).json({ error: "Linux agent is not bundled with this build" });
+    return;
+  }
+  res.download(AGENT_LINUX_SCRIPT_PATH, "lab-agent-linux.py");
 });
 
 export default router;

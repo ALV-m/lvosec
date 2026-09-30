@@ -3,6 +3,7 @@ export * from "./generated/types";
 export * from "./admin";
 export * from "./agent";
 export * from "./auth";
+export * from "./blue-team";
 export * from "./checkins";
 export * from "./peripherals";
 export * from "./reports";
