@@ -26,12 +26,17 @@ import {
 } from "@workspace/db";
 import {
   correlateLab,
+  correlateVpsTelemetry,
   evaluatePosture,
+  findVulnerablePackages,
   summariseLab,
+  VPS_AUTHFAIL_THRESHOLD,
   type LabFinding,
   type PostureCategory,
+  type PostureComputer,
   type PostureSummary,
   type SecuritySignals,
+  type VpsTelemetryRow,
 } from "../lib/blue-team/posture";
 import { DefenseStackResponse } from "@workspace/api-zod";
 import { bundledAgentVersion } from "../lib/agent-version";
@@ -91,6 +96,10 @@ function evaluateComputer(
       firewallEnabled: computer.firewallEnabled,
       diskFree: computer.diskFree,
       diskTotal: computer.diskTotal,
+      services: computer.services as PostureComputer["services"],
+      packages: computer.packages as PostureComputer["packages"],
+      authFailures: computer.authFailures as PostureComputer["authFailures"],
+      fimState: computer.fimState as PostureComputer["fimState"],
     },
     settings,
     security: signalsFor(computer),
@@ -202,6 +211,7 @@ router.get("/admin/blue-team/posture", async (_req, res): Promise<void> => {
       room: string;
       summary: PostureSummary;
     }> = [];
+    const vpsRows: VpsTelemetryRow[] = [];
     for (const computer of rows) {
       const summary = evaluateComputer(computer, settings);
       summaries.push({
@@ -221,10 +231,28 @@ router.get("/admin/blue-team/posture", async (_req, res): Promise<void> => {
         os: computer.os,
         summary,
       });
+      const isVps = /linux|ubuntu|debian/i.test(computer.os ?? "");
+      const hasTelemetry = Boolean(
+        computer.services || computer.packages || computer.authFailures || computer.fimState,
+      );
+      if (isVps && hasTelemetry) {
+        vpsRows.push({
+          computerId: computer.id,
+          computerName: computer.name,
+          room: computer.room,
+          os: computer.os,
+          authFailures: computer.authFailures as VpsTelemetryRow["authFailures"],
+          fimState: computer.fimState as VpsTelemetryRow["fimState"],
+          packages: computer.packages as VpsTelemetryRow["packages"],
+        });
+      }
     }
     labs.push(summariseLab(summaries));
     // Finding ids are namespaced per tenant so the merged list stays unique.
     for (const finding of correlateLab(summaries)) {
+      findings.push({ ...finding, id: `t${tenant.id}:${finding.id}` });
+    }
+    for (const finding of correlateVpsTelemetry(vpsRows)) {
       findings.push({ ...finding, id: `t${tenant.id}:${finding.id}` });
     }
   });
@@ -288,6 +316,18 @@ router.get("/admin/blue-team/defense-stack", async (_req, res): Promise<void> =>
   let findingCount = 0;
   let inventoryMachines = 0;
   let inventoryEntries = 0;
+  // VPS (Linux agent) telemetry aggregates for the blueprint layers.
+  let telemetryMachines = 0;
+  let authfailTotal = 0;
+  let authfailMachines = 0;
+  let fimDriftMachines = 0;
+  let fimCleanMachines = 0;
+  let packageMachines = 0;
+  let packageTotal = 0;
+  let vulnMachines = 0;
+  let serviceMachines = 0;
+  let serviceTotal = 0;
+  let serviceRunning = 0;
 
   await scanTenants(async (_tenant, tenantDb) => {
     const [rows, settingsRows] = await Promise.all([
@@ -303,6 +343,7 @@ router.get("/admin/blue-team/defense-stack", async (_req, res): Promise<void> =>
       room: string;
       summary: PostureSummary;
     }> = [];
+    const vpsRows: VpsTelemetryRow[] = [];
     for (const computer of rows) {
       summaries.push({
         computerId: computer.id,
@@ -317,9 +358,52 @@ router.get("/admin/blue-team/defense-stack", async (_req, res): Promise<void> =>
         inventoryMachines += 1;
         inventoryEntries += software.length;
       }
+
+      // VPS telemetry (JSONB columns come back as unknown).
+      const isVps = /linux|ubuntu|debian/i.test(computer.os ?? "");
+      const services = Array.isArray(computer.services)
+        ? (computer.services as Array<{ name: string; active?: string | null }>)
+        : [];
+      const packages = Array.isArray(computer.packages)
+        ? (computer.packages as Array<{ name: string; version?: string | null }>)
+        : [];
+      const auth = computer.authFailures as { count24h?: number } | null;
+      const fim = computer.fimState as { status?: string } | null;
+      const hasTelemetry = Boolean(services.length || packages.length || auth || fim);
+      if (isVps && hasTelemetry) {
+        telemetryMachines += 1;
+        if (services.length > 0) {
+          serviceMachines += 1;
+          serviceTotal += services.length;
+          serviceRunning += services.filter((s) => s.active === "active").length;
+        }
+        if (packages.length > 0) {
+          packageMachines += 1;
+          packageTotal += packages.length;
+          if (findVulnerablePackages(packages).length > 0) vulnMachines += 1;
+        }
+        if (auth && typeof auth.count24h === "number") {
+          authfailTotal += auth.count24h;
+          if (auth.count24h >= VPS_AUTHFAIL_THRESHOLD) authfailMachines += 1;
+        }
+        if (fim?.status === "drift") fimDriftMachines += 1;
+        else if (fim?.status === "clean") fimCleanMachines += 1;
+      }
+      if (isVps && hasTelemetry) {
+        vpsRows.push({
+          computerId: computer.id,
+          computerName: computer.name,
+          room: computer.room,
+          os: computer.os,
+          authFailures: computer.authFailures as VpsTelemetryRow["authFailures"],
+          fimState: computer.fimState as VpsTelemetryRow["fimState"],
+          packages: computer.packages as VpsTelemetryRow["packages"],
+        });
+      }
     }
     labs.push(summariseLab(summaries));
-    findingCount += correlateLab(summaries).length;
+    findingCount +=
+      correlateLab(summaries).length + correlateVpsTelemetry(vpsRows).length;
   });
 
   const lab = mergeLabs(labs);
@@ -358,6 +442,18 @@ router.get("/admin/blue-team/defense-stack", async (_req, res): Promise<void> =>
       count: allowCountries.length,
     },
     {
+      id: "brute_force",
+      label: "Brute-force · SSH",
+      state: authfailMachines > 0 ? "warning" : telemetryMachines > 0 ? "active" : "off",
+      detail:
+        telemetryMachines === 0
+          ? "No VPS telemetry yet (Linux agent 1.24+ reports failed logins hourly)"
+          : authfailMachines > 0
+            ? `${authfailMachines} server${authfailMachines === 1 ? "" : "s"} over the alert threshold after ${authfailTotal} failed ssh logins in 24h`
+            : `${authfailTotal} failed ssh logins in the last 24h across ${telemetryMachines} reporting server${telemetryMachines === 1 ? "" : "s"} — below threshold`,
+      count: authfailTotal,
+    },
+    {
       id: "detection",
       label: "Detection · Correlation",
       state: findingCount > 0 ? "warning" : "active",
@@ -366,6 +462,40 @@ router.get("/admin/blue-team/defense-stack", async (_req, res): Promise<void> =>
           ? `${findingCount} open correlation finding${findingCount === 1 ? "" : "s"} across the platform`
           : "No open correlation findings",
       count: findingCount,
+    },
+    {
+      id: "fim",
+      label: "Integrity · FIM",
+      state: fimDriftMachines > 0 ? "warning" : fimCleanMachines > 0 ? "active" : "off",
+      detail:
+        fimCleanMachines + fimDriftMachines === 0
+          ? "No VPS config-integrity baselines yet (established on the first hourly push)"
+          : fimDriftMachines > 0
+            ? `${fimDriftMachines} server${fimDriftMachines === 1 ? "" : "s"} with protected-file drift — investigate`
+            : `${fimCleanMachines} server${fimCleanMachines === 1 ? "" : "s"} with clean config-integrity baselines`,
+      count: fimDriftMachines,
+    },
+    {
+      id: "patch",
+      label: "Patch · Vulnerability",
+      state: vulnMachines > 0 ? "warning" : packageMachines > 0 ? "active" : "off",
+      detail:
+        packageMachines === 0
+          ? "No VPS package inventories yet (dpkg list reported hourly)"
+          : vulnMachines > 0
+            ? `${vulnMachines} server${vulnMachines === 1 ? "" : "s"} running end-of-life / widely-exploited package series`
+            : `${packageMachines} server${packageMachines === 1 ? "" : "s"} inventoried (${packageTotal} packages) — none flagged`,
+      count: vulnMachines,
+    },
+    {
+      id: "services",
+      label: "Services · systemd",
+      state: serviceMachines > 0 ? "active" : "off",
+      detail:
+        serviceMachines === 0
+          ? "No systemd service inventory yet (reported on the hourly channel)"
+          : `${serviceMachines} server${serviceMachines === 1 ? "" : "s"} reporting ${serviceTotal} services (${serviceRunning} running) — manage them in Blue Team`,
+      count: serviceRunning,
     },
     {
       id: "hosts",

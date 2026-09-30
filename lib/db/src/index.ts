@@ -183,6 +183,10 @@ const TENANT_DDL_STATEMENTS = [
   ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS disk_free bigint;
   ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS security_signals jsonb;
   ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS installed_software jsonb;
+  ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS services jsonb;
+  ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS packages jsonb;
+  ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS auth_failures jsonb;
+  ALTER TABLE lab_computers ADD COLUMN IF NOT EXISTS fim_state jsonb;
   `,
   `
   CREATE TABLE IF NOT EXISTS lab_actions (

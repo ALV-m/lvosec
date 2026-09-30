@@ -37,6 +37,8 @@ import {
   AgentScreenshotResponse,
   AgentSoftwareBody,
   AgentSoftwareResponse,
+  AgentTelemetryBody,
+  AgentTelemetryResponse,
   AgentUploadResponse,
   ReportFileListingBody,
 } from "@workspace/api-zod";
@@ -767,6 +769,42 @@ router.post("/agent/software", async (req, res): Promise<void> => {
     .where(eq(computersTable.id, computer.id));
 
   res.json(AgentSoftwareResponse.parse({ ok: true }));
+});
+
+/**
+ * VPS telemetry — the hourly, potentially-large channel separate from the
+ * heartbeat: systemd services, dpkg package inventory, sshd login-failure
+ * counts and the config-integrity (FIM) report. Individual fields are optional
+ * because agents learn them at different versions.
+ */
+router.post("/agent/telemetry", async (req, res): Promise<void> => {
+  const body = AgentTelemetryBody.safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: body.error.message });
+    return;
+  }
+
+  const [computer] = await db
+    .select()
+    .from(computersTable)
+    .where(eq(computersTable.agentToken, body.data.token))
+    .limit(1);
+  if (!computer) {
+    res.status(401).json({ error: "Invalid agent token" });
+    return;
+  }
+
+  await db
+    .update(computersTable)
+    .set({
+      services: body.data.services ?? computer.services ?? null,
+      packages: body.data.packages ?? computer.packages ?? null,
+      authFailures: body.data.authFailures ?? computer.authFailures ?? null,
+      fimState: body.data.fim ?? computer.fimState ?? null,
+    })
+    .where(eq(computersTable.id, computer.id));
+
+  res.json(AgentTelemetryResponse.parse({ ok: true }));
 });
 
 router.post(

@@ -70,6 +70,8 @@ export interface SecuritySignals {
   smbSigningRequired?: boolean | null;
   /** Remote Desktop accepting connections. */
   rdpEnabled?: boolean | null;
+  /** VPS only: ufw rate-limits SSH (`limit 22/tcp`, ~6 conn/30s). */
+  sshRateLimited?: boolean | null;
 
   // Data protection
   /** OS volume encrypted with BitLocker. */
@@ -108,6 +110,25 @@ export interface PostureComputer {
   firewallEnabled?: boolean | null;
   diskFree?: number | null;
   diskTotal?: number | null;
+  /**
+   * VPS (Linux agent) telemetry from the hourly channel. Absent on Windows lab
+   * machines; on a Linux host an absent field is `unknown`, never a pass.
+   */
+  services?: Array<{
+    name: string;
+    active?: string | null;
+    sub?: string | null;
+    enabled?: string | null;
+  }> | null;
+  packages?: Array<{ name: string; version?: string | null }> | null;
+  authFailures?: {
+    count24h?: number | null;
+    topSources?: Array<{ ip?: string; count?: number }> | null;
+  } | null;
+  fimState?: {
+    status?: "clean" | "drift" | null;
+    changed?: Array<{ path?: string; hash?: string }> | null;
+  } | null;
 }
 
 export interface PostureContext {
@@ -268,6 +289,45 @@ function ageInDays(from: Date | string | null | undefined, now: Date): number | 
   const t = typeof from === "string" ? new Date(from) : from;
   if (Number.isNaN(t.getTime())) return null;
   return Math.floor((now.getTime() - t.getTime()) / 86_400_000);
+}
+
+// ---------------------------------------------------------------------------
+// VPS patch risk — curated end-of-life markers
+//
+// Not a CVE feed and not a promise of completeness: only unambiguous markers
+// (whole series that are upstream-end-of-life and routinely exploited) count,
+// so "0 known-vulnerable packages" stays a meaningful statement.
+// ---------------------------------------------------------------------------
+
+export const VPS_AUTHFAIL_THRESHOLD = 10;
+
+const KNOWN_VULNERABLE_PREFIXES: Array<{ name: string; prefixes: string[] }> = [
+  { name: "openssl", prefixes: ["1.1.1"] }, // 1.1.1 EOL since Sept 2023
+  { name: "bash", prefixes: ["4."] }, // 4.x EOL since 2019; 5.x is current
+  { name: "php", prefixes: ["7.", "8.0.", "8.1."] }, // 8.1 EOL Nov 2024
+  { name: "python3", prefixes: ["3.6", "3.7", "3.8"] }, // 3.8 EOL Oct 2024
+];
+
+export interface VulnerablePackage {
+  name: string;
+  version: string;
+}
+
+export function findVulnerablePackages(
+  packages: Array<{ name: string; version?: string | null }> | null | undefined,
+): VulnerablePackage[] {
+  if (!packages || packages.length === 0) return [];
+  const byName = new Map(packages.map((p) => [p.name.toLowerCase(), p]));
+  const found: VulnerablePackage[] = [];
+  for (const rule of KNOWN_VULNERABLE_PREFIXES) {
+    const pkg = byName.get(rule.name.toLowerCase());
+    if (!pkg?.version) continue;
+    const version = pkg.version.toLowerCase();
+    if (rule.prefixes.some((prefix) => version === prefix || version.startsWith(prefix))) {
+      found.push({ name: pkg.name, version: pkg.version });
+    }
+  }
+  return found;
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +717,156 @@ export function evaluatePosture(ctx: PostureContext): PostureSummary {
     );
   }
 
+  // --- VPS (Linux agent) telemetry ------------------------------------------
+  // The Blue Team protects VPS servers too, so these checks run per-host the
+  // same way the Windows checks do — but only against Linux hosts, where the
+  // data can exist. A Windows lab machine cannot collect services/packages/
+  // auth-logs, so the checks are skipped entirely rather than reported as
+  // unknown. On a Linux host, absent telemetry is `unknown`: never a pass.
+  const isVps = /linux|ubuntu|debian/i.test(computer.os ?? "");
+
+  if (isVps) {
+    const auth = computer.authFailures ?? null;
+    const authKnown = auth !== null && (auth.count24h ?? null) !== null;
+    if (!authKnown) {
+      push(
+        finding(
+          "vps_authfail",
+          "unknown",
+          "info",
+          "detection",
+          "SSH brute-force exposure",
+          "This VPS has not reported login-failure data yet. Linux agent 1.24+ sends it on the hourly telemetry channel.",
+          "Update the agent; failed-ssh-login counts appear on its next telemetry push.",
+        ),
+      );
+    } else if ((auth?.count24h ?? 0) >= VPS_AUTHFAIL_THRESHOLD) {
+      const sources = (auth?.topSources ?? [])
+        .slice(0, 3)
+        .filter((s) => s.ip)
+        .map((s) => `${s.ip} (${s.count ?? 0})`)
+        .join(", ");
+      push(
+        finding(
+          "vps_authfail",
+          "fail",
+          "high",
+          "detection",
+          "SSH brute-force attack in progress",
+          `${auth?.count24h ?? 0} failed ssh logins in the last 24 hours${sources ? ` — top sources: ${sources}` : ""}.`,
+          "Confirm the attempts are not your own monitors, rotate any exposed credentials, restrict SSH to known IPs, and enable SSH rate limiting (Blue Team → VPS action → rate limit SSH).",
+        ),
+      );
+    } else {
+      push(
+        finding(
+          "vps_authfail",
+          "pass",
+          "info",
+          "detection",
+          "No failed ssh logins",
+          `${auth?.count24h ?? 0} failed logins in the last 24 hours — no brute-force noise.`,
+          "Nothing to do.",
+        ),
+      );
+    }
+
+    push(
+      triState("vps_ssh_rate_limited", security.sshRateLimited, {
+        category: "network",
+        severity: "medium",
+        title: "SSH rate limiting is off",
+        pass: "SSH is rate-limited by the host firewall (ufw limit).",
+        fail: () =>
+          "SSH accepts unlimited connection attempts — brute-force scripts can hammer it freely.",
+        remediation:
+          "Run “Rate limit SSH” from Blue Team → VPS actions (ufw limit 22/tcp, ~6 new connections per 30 seconds per source).",
+      }),
+    );
+
+    const fim = computer.fimState ?? null;
+    const fimKnown = fim !== null && (fim.status ?? null) !== null;
+    if (!fimKnown) {
+      push(
+        finding(
+          "vps_fim_drift",
+          "unknown",
+          "info",
+          "configuration",
+          "Config integrity (FIM) not reporting",
+          "This VPS has not reported its config-integrity baseline yet. Linux agent 1.24+ snapshots sshd/account/boot configs hourly.",
+          "Update the agent; the first telemetry push establishes the hash baseline.",
+        ),
+      );
+    } else if (fim?.status === "drift") {
+      const changed = (fim.changed ?? []).slice(0, 5).map((c) => c.path).filter(Boolean).join(", ");
+      push(
+        finding(
+          "vps_fim_drift",
+          "fail",
+          "high",
+          "configuration",
+          "Protected files changed",
+          `${(fim.changed ?? []).length} protected file(s) no longer match the baseline${changed ? `: ${changed}` : ""}. A config-tampering / rootkit signature — or a legitimate admin edit.`,
+          "Review each changed path on the server. Revert edits that were not yours and treat unexplained drift as a potential compromise.",
+        ),
+      );
+    } else {
+      push(
+        finding(
+          "vps_fim_drift",
+          "pass",
+          "info",
+          "configuration",
+          "Protected files unchanged",
+          "The config-integrity baseline matches — no unexpected changes to sshd, accounts or boot config.",
+          "Nothing to do.",
+        ),
+      );
+    }
+
+    const hasPackages = computer.packages !== null && computer.packages !== undefined;
+    const vulnerable = findVulnerablePackages(computer.packages);
+    if (!hasPackages) {
+      push(
+        finding(
+          "vps_vuln_packages",
+          "unknown",
+          "info",
+          "configuration",
+          "Patch risk not reporting",
+          "This VPS has not reported its package inventory yet. Linux agent 1.24+ sends the dpkg list hourly.",
+          "Update the agent; the hourly telemetry push includes the package inventory.",
+        ),
+      );
+    } else if (vulnerable.length > 0) {
+      const names = vulnerable.slice(0, 5).map((v) => `${v.name} ${v.version}`).join(", ");
+      push(
+        finding(
+          "vps_vuln_packages",
+          "fail",
+          "high",
+          "configuration",
+          "Known-vulnerable software installed",
+          `${vulnerable.length} package(s) in an end-of-life / widely-exploited series: ${names}. Curated marker list, not a full CVE feed.`,
+          "Upgrade the flagged packages from the distro repository, or move the server to a supported release.",
+        ),
+      );
+    } else {
+      push(
+        finding(
+          "vps_vuln_packages",
+          "pass",
+          "info",
+          "configuration",
+          "No known-vulnerable packages",
+          `${computer.packages?.length ?? 0} packages inventoried; none match the curated end-of-life marker list.`,
+          "Nothing to do.",
+        ),
+      );
+    }
+  }
+
   return summarise(findings, NOISE_LEVEL);
 }
 
@@ -871,6 +1081,107 @@ export function correlateLab(
         computerIds: [entry.computerId],
       });
     }
+  }
+
+  return findings.sort(
+    (a, b) =>
+      SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity] ||
+      b.affected - a.affected,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// VPS telemetry correlation — the same "SOC across machines" math, but for
+// what the Linux agents report: brute-force spikes, config drift and package
+// risk. Called by the platform Blue Team alongside correlateLab.
+// ---------------------------------------------------------------------------
+
+export interface VpsTelemetryRow {
+  computerId: number;
+  computerName: string;
+  room: string;
+  os?: string | null;
+  authFailures?: PostureComputer["authFailures"];
+  fimState?: PostureComputer["fimState"];
+  packages?: PostureComputer["packages"];
+}
+
+export function correlateVpsTelemetry(rows: VpsTelemetryRow[]): LabFinding[] {
+  const findings: LabFinding[] = [];
+  const total = Math.max(1, rows.length);
+
+  // 1. Brute-force spike — one machine is being hammered, or several are.
+  const spiked = rows.filter((row) => (row.authFailures?.count24h ?? 0) >= VPS_AUTHFAIL_THRESHOLD);
+  if (spiked.length === 1) {
+    const row = spiked[0]!;
+    findings.push({
+      id: `vps_bruteforce:${row.computerId}`,
+      title: "VPS under active ssh brute-force",
+      severity: "high",
+      detail: `${row.computerName} saw ${row.authFailures?.count24h ?? 0} failed ssh logins in the last 24 hours.`,
+      remediation:
+        "Rotate exposed credentials, restrict SSH to known IPs, and enable SSH rate limiting from Blue Team → VPS actions.",
+      category: "detection",
+      affected: 1,
+      total,
+      computerIds: [row.computerId],
+    });
+  } else if (spiked.length > 1) {
+    const names = spiked.map((s) => s.computerName).join(", ");
+    findings.push({
+      id: "vps_bruteforce_wave",
+      title: "Multiple VPS under ssh brute-force",
+      severity: "high",
+      detail: `${spiked.length} server(s) logged ${spiked
+        .map((s) => `${s.computerName} (${s.authFailures?.count24h ?? 0})`)
+        .join(", ")} failed logins in 24 hours. Same-attacker signature.`,
+      remediation:
+        "Block the common source IPs at the firewall, rotate every exposed credential, and enable SSH rate limiting fleet-wide.",
+      category: "detection",
+      affected: spiked.length,
+      total,
+      computerIds: spiked.map((s) => s.computerId),
+    });
+  }
+
+  // 2. Possible active intrusion — brute-force spike AND config drift on the
+  //    same host is what a compromise looks like from a posture engine.
+  for (const row of rows) {
+    const hammered = (row.authFailures?.count24h ?? 0) >= VPS_AUTHFAIL_THRESHOLD;
+    const drifted = row.fimState?.status === "drift";
+    if (hammered && drifted) {
+      findings.push({
+        id: `vps_compromised:${row.computerId}`,
+        title: "Possible active intrusion on a VPS",
+        severity: "critical",
+        detail: `${row.computerName} is under ssh brute-force AND its protected config files changed. Treat as compromised until proven otherwise.`,
+        remediation:
+          "Disconnect the server, preserve the disk image and review /var/log/auth.log and the changed files. Do not just reboot it.",
+        category: "detection",
+        affected: 1,
+        total,
+        computerIds: [row.computerId],
+      });
+    }
+  }
+
+  // 3. Vulnerable fleet — two or more distinct servers carrying EOL packages
+  //    is a rollout problem, not independent accidents.
+  const withVulns = rows.filter((row) => findVulnerablePackages(row.packages).length > 0);
+  if (withVulns.length >= 2) {
+    const names = withVulns.map((s) => s.computerName).join(", ");
+    findings.push({
+      id: "vps_vuln_wave",
+      title: "End-of-life software across servers",
+      severity: "medium",
+      detail: `${withVulns.length} server(s) run packages from end-of-life series (${names}). One lapse is a mistake; several is a base image problem.`,
+      remediation:
+        "Fix the base image or update policy once, then re-patch every affected server from the distro repo.",
+      category: "configuration",
+      affected: withVulns.length,
+      total,
+      computerIds: withVulns.map((s) => s.computerId),
+    });
   }
 
   return findings.sort(

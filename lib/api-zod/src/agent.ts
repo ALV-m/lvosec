@@ -23,6 +23,14 @@ export const AgentComputerAction = zod.enum([
   "disable_rdp",
   "shutdown",
   "sleep",
+  // VPS (Linux agent) service management + SSH rate limiting.
+  "service_start",
+  "service_stop",
+  "service_restart",
+  "service_enable",
+  "service_disable",
+  "fw_limit_ssh",
+  "fw_unlimit_ssh",
 ]);
 
 export const AgentRegisterBody = zod.object({
@@ -102,6 +110,11 @@ export const AgentHeartbeatBody = zod.object({
       localAdminCount: zod.number().nullish(),
       /** Winlogon AutoAdminLogon state, compared against the sign-in method. */
       autoLogonEnabled: zod.boolean().nullish(),
+      /**
+       * VPS only: whether the host firewall rate-limits SSH
+       * (ufw `limit 22/tcp` / `limit OpenSSH`, ~6 connections per 30s).
+       */
+      sshRateLimited: zod.boolean().nullish(),
     })
     .nullish(),
 });
@@ -184,6 +197,61 @@ export const AgentSoftwareBody = zod.object({
   token: zod.string().min(1),
   /** Full installed-software snapshot, deduplicated, sorted. */
   software: zod.array(SoftwareEntry).max(600),
+});
+
+// ---------------------------------------------------------------------------
+// VPS telemetry (Linux lvosec agent, hourly channel). Separate from the
+// heartbeat on purpose: services/packages can be hundreds of entries and the
+// heartbeat runs every 10 seconds and must stay small.
+// ---------------------------------------------------------------------------
+
+export const ServiceEntry = zod.object({
+  /** systemd unit name, e.g. "ssh.service". */
+  name: zod.string().min(1).max(256),
+  /** active | inactive | failed | activating | deactivating. */
+  active: zod.string().max(32),
+  /** running | exited | dead | … */
+  sub: zod.string().max(32).nullish(),
+  /** enabled | disabled | static | masked | … */
+  enabled: zod.string().max(32).nullish(),
+});
+export type ServiceEntry = zod.infer<typeof ServiceEntry>;
+
+export const PackageEntry = zod.object({
+  name: zod.string().min(1).max(256),
+  version: zod.string().min(1).max(128),
+});
+export type PackageEntry = zod.infer<typeof PackageEntry>;
+
+export const AuthFailureReport = zod.object({
+  /** Failed ssh logins seen in the current auth log (≈ last 24h before rotation). */
+  count24h: zod.number().int().nonnegative(),
+  topSources: zod
+    .array(zod.object({ ip: zod.string().min(1).max(64), count: zod.number().int().nonnegative() }))
+    .nullish(),
+});
+export type AuthFailureReport = zod.infer<typeof AuthFailureReport>;
+
+export const FimReport = zod.object({
+  /** clean = protected files match baseline · drift = something changed. */
+  status: zod.enum(["clean", "drift"]),
+  changed: zod
+    .array(zod.object({ path: zod.string().min(1).max(512), hash: zod.string().max(128) }))
+    .nullish(),
+});
+export type FimReport = zod.infer<typeof FimReport>;
+
+export const AgentTelemetryBody = zod.object({
+  token: zod.string().min(1),
+  services: zod.array(ServiceEntry).max(500).nullish(),
+  packages: zod.array(PackageEntry).max(5000).nullish(),
+  authFailures: AuthFailureReport.nullish(),
+  fim: FimReport.nullish(),
+});
+export type AgentTelemetryBody = zod.infer<typeof AgentTelemetryBody>;
+
+export const AgentTelemetryResponse = zod.object({
+  ok: zod.boolean(),
 });
 
 export const AgentCheckinRole = zod.enum(["student", "teacher", "visitor", "admin"]);

@@ -47,7 +47,7 @@ import Sessions from "@/pages/sessions";
 import UsbPolicies from "@/pages/usb-policies";
 import UsersPage from "@/pages/users";
 import AdminLoginPage from "@/pages/admin/login";
-import AdminDashboard from "@/pages/admin/dashboard";
+import AdminLayout from "@/pages/admin/layout";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -367,7 +367,7 @@ function AdminApp() {
         <Route path="*">
           {() => (
             <RequireAdmin>
-              <AdminDashboard />
+              <AdminLayout />
             </RequireAdmin>
           )}
         </Route>
