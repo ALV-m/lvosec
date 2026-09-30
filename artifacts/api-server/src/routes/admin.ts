@@ -61,7 +61,9 @@ import {
   resetTenantSuperAdmin,
 } from "../lib/tenant";
 import { queueMachineAction } from "../lib/machine-actions";
+import { classifyMachineKind } from "../lib/machine-kind";
 import { logger } from "../lib/logger";
+import adminBlueTeamRouter from "./admin-blue-team";
 
 const router: IRouter = Router();
 
@@ -114,6 +116,10 @@ router.post("/admin/logout", async (req, res): Promise<void> => {
 });
 
 router.use("/admin", requirePlatformAuth);
+
+// Platform-wide Blue Team (SOC seat, moved out of the tenant comp lab). Mounted
+// after requirePlatformAuth, so every request below is platform-admin-gated.
+router.use(adminBlueTeamRouter);
 
 router.get("/admin/me", async (req, res): Promise<void> => {
   const admin = req.platformAdmin!;
@@ -578,6 +584,9 @@ const mapPlatformMachine = (
       ? computer.lastSeen.toISOString()
       : String(computer.lastSeen),
   os: computer.os,
+  // Determines which Platform Admin "service" the machine belongs to:
+  // a Windows lab computer or a Linux cloud VPS.
+  kind: classifyMachineKind(computer.os),
   agentVersion: computer.agentVersion,
   usbState: computer.usbState,
   avEnabled: computer.avEnabled,

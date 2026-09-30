@@ -33,6 +33,8 @@ export type SubmenuKey =
   | "events"
   | "checkins"
   | "agent"
+  // Inert: kept so submenu_access granted before the Blue Team move still
+  // parses. No route or UI surface uses it anymore.
   | "blue_team"
   | "settings"
   | "users";

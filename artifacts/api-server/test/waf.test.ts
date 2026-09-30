@@ -75,7 +75,7 @@ describe("WAF-lite", () => {
       "/t/lab/api/agent/register",
       "/admin/login",
       "/api/healthz",
-      "/t/lab/api/blue-team/posture",
+      "/t/lab/api/lab/computers",
     ]) {
       const d = evaluateWaf(req({ path }));
       expect(d.action).toBe("allow", `expected ${path} allowed`);

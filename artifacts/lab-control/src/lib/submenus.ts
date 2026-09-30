@@ -14,6 +14,9 @@ export const SUBMENU_LABELS: Record<SubmenuKey, string> = {
   events: "Events",
   checkins: "Check-ins",
   agent: "Agent",
+  // Inert lookup entry (kept so old grants still render a label); not offered
+  // in the grant UI because ALL_SUBMENUS drives it and Blue Team moved to
+  // Platform Admin.
   blue_team: "Blue Team",
   settings: "Settings",
   users: "Users",
@@ -52,7 +55,6 @@ export const ALL_SUBMENUS: SubmenuKey[] = [
   "events",
   "checkins",
   "agent",
-  "blue_team",
   "settings",
   "users",
 ];

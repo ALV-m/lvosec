@@ -138,6 +138,9 @@ export const DbConnectionIdParams = zod.object({
 // network status (IP, MAC, firewall on/off, last seen) and management actions.
 // ---------------------------------------------------------------------------
 
+export const PlatformMachineKind = zod.enum(["computer", "vps"]);
+export type PlatformMachineKind = zod.infer<typeof PlatformMachineKind>;
+
 export const PlatformMachine = zod.object({
   tenantId: zod.number(),
   tenantName: zod.string(),
@@ -150,6 +153,10 @@ export const PlatformMachine = zod.object({
   userName: zod.string().nullable(),
   lastSeen: zod.string(),
   os: zod.string().nullable(),
+  // "computer" = Windows lab machine · "vps" = Linux cloud server (lvosec
+  // Linux agent). The Platform Admin dashboard protects them as separate
+  // services.
+  kind: PlatformMachineKind,
   agentVersion: zod.string().nullable(),
   usbState: zod.string(),
   avEnabled: zod.boolean().nullable(),

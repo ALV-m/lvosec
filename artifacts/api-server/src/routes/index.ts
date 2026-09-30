@@ -4,7 +4,6 @@ import { tenantContextMiddleware } from "../lib/tenant";
 import adminRouter from "./admin";
 import agentRouter from "./agent";
 import authRouter from "./auth";
-import blueTeamRouter from "./blue-team";
 import checkinsRouter from "./checkins";
 import filesRouter from "./files";
 import healthRouter from "./health";
@@ -56,7 +55,6 @@ tenantRouter.use(requireSubmenuAccess);
 
 tenantRouter.use(checkinsRouter);
 tenantRouter.use(filesRouter);
-tenantRouter.use(blueTeamRouter);
 tenantRouter.use(labRouter);
 tenantRouter.use(peripheralsRouter);
 tenantRouter.use(reportsRouter);

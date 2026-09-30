@@ -14,6 +14,9 @@ export const SUBMENUS = [
   "events",
   "checkins",
   "agent",
+  // Inert but kept: deployments granted "blue_team" before the SOC seat moved
+  // to Platform Admin, so stored submenu_access still validates. No route or
+  // UI surface uses it anymore.
   "blue_team",
   "settings",
   "users",
