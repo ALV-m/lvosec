@@ -1,14 +1,30 @@
-# Platform Machines (Super Admin)
+# Platform Machines (Platform Admin)
 
 The **Machines** section of the Platform Admin dashboard (`/admin`) is the
-platform-wide "manage VPS networking in server" view: every tenant's
-computers and servers — lab PCs, VPSes, what have you — under one Super Admin
+platform-wide fleet view: every tenant's machines under one Platform Admin
 dashboard, with live network status and the same operator controls each lab
 already has.
 
 It reuses the exact agent action pipeline as the per-lab dashboard
 (`queueMachineAction`), so behavior is identical whether a command is issued
 from a tenant's Lab page or from here. No new agent work was required.
+
+## Two services, one view
+
+Platform Admin protects two different kinds of service, shown as **tabs**:
+
+| Tab | What it lists | Agent |
+| --- | --- | --- |
+| **Computers** | Windows lab machines | `lab-agent.ps1` (PowerShell) |
+| **Cloud VPS** | Linux cloud servers — Ubuntu/Debian VPSes (Contabo-style) | `lab-agent-linux.py` (lvosec Linux agent) |
+
+Classification is derived from the `os` string the agent reports on each
+heartbeat (`classifyMachineKind`): Linux-family OS → **Cloud VPS**, everything
+else → **Computers**. No schema change needed — installing the Linux agent on a
+server makes it show up under Cloud VPS automatically.
+
+Both tabs share the same table columns and the same protective controls; a
+VPS row is tagged with a **VPS** badge.
 
 ## What you see per machine
 
@@ -17,7 +33,7 @@ row (last heartbeat + agent-reported signals):
 
 | Column | Meaning |
 | --- | --- |
-| Machine | Name + signed-in user + agent version |
+| Machine | Name (+ **VPS** badge for Linux servers) + OS / signed-in user + agent version |
 | Tenant | Which lab account owns the machine |
 | Room | Assigned room |
 | IP | Agent-reported public/primary IP (`ipAddress`) |
@@ -26,8 +42,9 @@ row (last heartbeat + agent-reported signals):
 | Firewall | Agent-reported `firewallEnabled` — On / Off / ? (not reported) |
 | USB | Current usb policy — `allowed` / `blocked` |
 
-Summary chips across the whole fleet: total machines, online, locked, and a
-red flag for any machine whose firewall is reported **Off**.
+Summary chips across the whole fleet: total machines, computers, cloud VPS,
+online, locked, and a red flag for any machine whose firewall is reported
+**Off**.
 
 ## Controls (shared with the lab dashboard)
 
@@ -57,7 +74,11 @@ drives from reaching decommissioned accounts.
 
 ## Scope limits (deliberate)
 
-- No remote desktop / `remote_view` / `remote_input` from the Super Admin view —
+- No remote desktop / `remote_view` / `remote_input` from the Platform Admin view —
   those stay tenant-internal.
-- No per-port firewall *rules* editing — only the on/off switch.
+- No per-port firewall *rules* editing — only the on/off switch (ufw on VPSes,
+  Windows firewall on computers).
 - No agent push / server URL rotation / file push from here.
+- Attaching a new VPS is done from the Platform Admin **Blue Team → Cloud VPS
+  protection → Add VPS** (pick the target tenant, then run the agent one-liner
+  on the server); it then appears under Cloud VPS here.

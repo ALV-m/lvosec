@@ -31,6 +31,8 @@ export interface PlatformMachine {
   userName: string | null;
   lastSeen: string;
   os: string | null;
+  // "computer" = Windows lab machine · "vps" = Linux cloud server.
+  kind: "computer" | "vps";
   agentVersion: string | null;
   usbState: string;
   avEnabled: boolean | null;

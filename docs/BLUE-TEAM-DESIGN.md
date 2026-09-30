@@ -487,10 +487,12 @@ event appears, then let it roll.
 
 ## 12. SOC blueprint → shipped mapping (Defense Stack)
 
-The Blue Team dashboard (`/t/:slug/blue-team`) now leads with a **Defense
-Stack** view — one live-status card per defensive layer of the enterprise SOC
-blueprint — plus a **Machines · VPS** fleet section, making the Blue Team seat
-the one used to protect machines and VPSes through lvosec.
+The **Blue Team seat moved to the Platform Admin dashboard** (Platform Admin →
+Blue Team); the per-tenant comp lab no longer shows it. It leads with a
+**Defense Stack** view — one live-status card per defensive layer of the
+enterprise SOC blueprint, aggregated across every tenant — plus a **Cloud VPS
+protection** section, making the Blue Team seat the one used to protect
+machines and VPSes platform-wide.
 
 ### 12.1 Layer mapping — what is real here
 
@@ -500,33 +502,41 @@ the one used to protect machines and VPSes through lvosec.
 | 2. Detection & correlation | ✅ Shipped | Posture engine + `correlateLab` wave/compounding findings + IOC record search over events/actions/alerts/checkins. Stack shows open-findings count. |
 | 3. IDS/IPS — DPI, TLS MITM, portspoof, port-knocking | ⛔ Out of scope | Needs network-layer reach the agent cannot give. Labeled “not in scope” on the stack. |
 | 4. Asset inventory | ✅ Shipped | Software inventory on the 1-hour channel + hardware fingerprint per computer. Stack shows inventoried-machine and entry counts. |
-| 5. Server hardening & host mgmt | ✅ Shipped | Posture checks per host + the Blue Team **Machines · VPS** section. |
+| 5. Server hardening & host mgmt | ✅ Shipped | Posture checks per host + the Blue Team **Cloud VPS protection** section. |
 | 6. Database audit & management | ✅ Shipped | Super Admin DB registry, health checks, manual per-target snapshots (`docs/DB-MANAGEMENT.md`). Stack shows registry totals. |
 | 7. DLP / PAM/DAM / data masking / air-gap | ⛔ Out of scope | Declined; labeled honestly on the stack. |
 
-The stack endpoint is `GET /api/blue-team/defense-stack` — it derives every
-state from the same tables the rest of the dashboard reads (posture evaluation,
-correlation findings, installed-software, `platform_db_connections`), so the
-view cannot claim a layer is healthy its own data doesn't support.
+The stack endpoint is now `GET /api/admin/blue-team/defense-stack` — it derives
+every state from the same tables the rest of the dashboard reads (posture
+evaluation, correlation findings, installed-software, `platform_db_connections`),
+aggregating counts across all tenants, so the view cannot claim a layer is
+healthy its own data doesn't support.
 
-### 12.2 Machines · VPS — the blue team seat protects the fleet
+### 12.2 Cloud VPS protection — the platform seat protects the fleet
 
-Top of the Blue Team page, `GET /api/lab/computers` + `POST
-/api/lab/computers/:id/actions` (both pre-existing) now double as the **VPS
-protection seat**:
+In Platform Admin, the Blue Team section's **Cloud VPS protection** table lists
+every Linux server across all tenants (machines whose reported OS classifies as
+`vps`), with the same network columns and operator controls the per-lab
+Computers page has:
 
-- **Add machine** dialog prints the one-command installer for **both**
-  platforms — Windows PowerShell (lab PCs, the classic agent) and **Linux**
-  (Ubuntu/Debian VPSes via a Python 3 companion that speaks the same
-  protocol; `docs/VPS-AGENT.md`). Run it on the machine; it registers itself
-  under this account and shows up here within a minute.
-- Columns: machine + signed-in user + agent version, public **IP**, status
-  (`online` / `locked` / `offline`), **firewall** On/Off/? from the heartbeat,
-  **USB** policy, last seen.
+- **Add VPS** dialog prints the one-command installer for **both** platforms —
+  Windows PowerShell (lab PCs, the classic agent) and **Linux** (Ubuntu/Debian
+  VPSes via a Python 3 companion that speaks the same protocol;
+  `docs/VPS-AGENT.md`) — plus a **tenant picker**, because the agent enrolls
+  into a tenant schema. Run it on the machine; it registers under that tenant
+  and shows up here within a minute.
+- Columns: machine + OS/signed-in user + agent version, **tenant**, public
+  **IP**, status (`online` / `locked` / `offline`), **firewall** On/Off/? from
+  the heartbeat, **USB** policy, last seen.
 - Controls: `lock`/`unlock`, `restart` (confirmation), `block_usb`/`allow_usb`
   toggle, `fw_enable`/`fw_disable` toggle, `send_message` with text — all
-  through `queueMachineAction`, audited with actor in `lab_events`, identical
-  behavior to the Computers page.
+  through `queueMachineAction` (via `POST /api/admin/machines/:tenantId/:computerId/actions`),
+  audited with actor in `lab_events`, identical behavior to the Computers page.
 
-Per-VPS walkthrough: `docs/VPS-AGENT.md`. The platform-wide (all-accounts)
-fleet view lives in Admin → Machines (`docs/PLATFORM-MACHINES.md`).
+Posture, correlation findings, record search and software inventory are
+also platform-wide (`/api/admin/blue-team/posture`,
+`/api/admin/blue-team/search`, `/api/admin/blue-team/software`).
+
+Per-VPS walkthrough: `docs/VPS-AGENT.md`. The full platform-wide fleet view
+(computers **and** VPSes as separate services) lives in Admin → Machines
+(`docs/PLATFORM-MACHINES.md`).

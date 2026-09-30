@@ -11,6 +11,7 @@ import {
   Lock,
   LockOpen,
   MessageSquare,
+  Monitor,
   Power,
   RefreshCw,
   Server,
@@ -92,6 +93,7 @@ export function MachinesSection() {
 
   const [filter, setFilter] = useState("");
   const [tenantFilter, setTenantFilter] = useState("all");
+  const [kindTab, setKindTab] = useState<"all" | "computer" | "vps">("all");
   const [busy, setBusy] = useState<string | null>(null);
   const [restartTarget, setRestartTarget] = useState<PlatformMachine | null>(null);
   const [messageTarget, setMessageTarget] = useState<PlatformMachine | null>(null);
@@ -103,6 +105,7 @@ export function MachinesSection() {
   );
 
   const visible = machines.filter((machine) => {
+    if (kindTab !== "all" && machine.kind !== kindTab) return false;
     if (tenantFilter !== "all" && machine.tenantName !== tenantFilter) return false;
     const q = filter.trim().toLowerCase();
     if (!q) return true;
@@ -114,6 +117,8 @@ export function MachinesSection() {
   const counts = useMemo(() => {
     return {
       total: machines.length,
+      computers: machines.filter((m) => m.kind === "computer").length,
+      vps: machines.filter((m) => m.kind === "vps").length,
       online: machines.filter((m) => m.status === "online").length,
       locked: machines.filter((m) => m.status === "locked").length,
       firewallOff: machines.filter((m) => m.firewallEnabled === false).length,
@@ -180,10 +185,53 @@ export function MachinesSection() {
       <div className="flex flex-col gap-1">
         <h2 className="text-xl font-bold">Machines</h2>
         <p className="text-sm text-muted-foreground">
-          Every tenant's computers and servers in one platform-wide view —
-          network status (IP, MAC, firewall, last seen) with firewall, USB,
-          lock, restart and message controls.
+          Two services protected from one place — <strong>Computers</strong>{" "}
+          (Windows lab machines) and <strong>Cloud VPS</strong> (Linux servers
+          via the lvosec Linux agent) — with firewall, USB, lock, restart and
+          message controls.
         </p>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1 rounded-lg border bg-muted/40 p-1 w-fit">
+        <button
+          type="button"
+          onClick={() => setKindTab("all")}
+          aria-pressed={kindTab === "all"}
+          className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+            kindTab === "all"
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <Server className="size-4" />
+          All ({counts.total})
+        </button>
+        <button
+          type="button"
+          onClick={() => setKindTab("computer")}
+          aria-pressed={kindTab === "computer"}
+          className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+            kindTab === "computer"
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <Monitor className="size-4" />
+          Computers ({counts.computers})
+        </button>
+        <button
+          type="button"
+          onClick={() => setKindTab("vps")}
+          aria-pressed={kindTab === "vps"}
+          className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+            kindTab === "vps"
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <Server className="size-4" />
+          Cloud VPS ({counts.vps})
+        </button>
       </div>
 
       <Card>
@@ -191,11 +239,28 @@ export function MachinesSection() {
           <div className="flex flex-row items-start justify-between gap-4 space-y-0">
             <div className="space-y-1">
               <CardTitle className="flex items-center gap-2">
-                <Server className="size-4 text-muted-foreground" />
-                All machines
+                {kindTab === "vps" ? (
+                  <Server className="size-4 text-muted-foreground" />
+                ) : kindTab === "computer" ? (
+                  <Monitor className="size-4 text-muted-foreground" />
+                ) : (
+                  <Server className="size-4 text-muted-foreground" />
+                )}
+                {kindTab === "vps"
+                  ? "Cloud VPS"
+                  : kindTab === "computer"
+                    ? "Computers"
+                    : "All machines"}
               </CardTitle>
               <CardDescription>
-                {counts.total} machines · {counts.online} online · {counts.locked} locked
+                {kindTab === "vps"
+                  ? `${counts.vps} cloud servers · Linux agents (ufw firewall, USB, lock, message)`
+                  : kindTab === "computer"
+                    ? `${counts.computers} Windows lab machines`
+                    : `${counts.total} machines · ${counts.computers} computers · ${counts.vps} cloud VPS`}
+                {" · "}
+                {counts.online} online
+                {counts.locked > 0 ? ` · ${counts.locked} locked` : ""}
                 {counts.firewallOff > 0 ? ` · ${counts.firewallOff} firewalls OFF` : ""}
               </CardDescription>
             </div>
@@ -261,8 +326,11 @@ export function MachinesSection() {
                     colSpan={9}
                     className="py-8 text-center text-sm text-muted-foreground"
                   >
-                    No machines match — connect lab agents and they appear here
-                    by tenant.
+                    {kindTab === "vps"
+                      ? "No cloud VPS yet — install the lvosec Linux agent on a server (Blue Team → Machines · VPS → Add machine) and it appears here."
+                      : kindTab === "computer"
+                        ? "No computers yet — connect Windows lab agents and they appear here by tenant."
+                        : "No machines match — connect lab agents or install the Linux agent, and they appear here by tenant."}
                   </TableCell>
                 </TableRow>
               ) : (
@@ -270,9 +338,16 @@ export function MachinesSection() {
                   <TableRow key={keyOf(machine)}>
                     <TableCell>
                       <div className="flex flex-col">
-                        <span className="font-medium">{machine.name}</span>
+                        <span className="flex items-center gap-1.5 font-medium">
+                          {machine.name}
+                          {machine.kind === "vps" ? (
+                            <Badge variant="info" className="px-1.5 py-0 text-[10px]">
+                              VPS
+                            </Badge>
+                          ) : null}
+                        </span>
                         <span className="text-xs text-muted-foreground">
-                          {machine.userName ?? "—"} · agent{" "}
+                          {machine.os ?? machine.userName ?? "—"} · agent{" "}
                           {machine.agentVersion ?? "?"}
                         </span>
                       </div>

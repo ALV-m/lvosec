@@ -1,23 +1,23 @@
 import { useState, type FormEvent } from "react";
 import {
-  type Computer,
-  type ComputerActionInputAction,
-  type DefenseLayer,
+  useGetAdminBlueTeamDefenseStack,
+  useGetAdminBlueTeamPosture,
+  useGetAdminBlueTeamSoftware,
+  useGetAdminMachines,
+  useListAdminTenants,
+  useRunAdminMachineAction,
+  searchAdminBlueTeamRecords,
   type DefenseLayerState,
   type LabFinding,
+  type PlatformMachine,
+  type PlatformMachineAction,
   type PostureFinding,
   type PostureSeverity,
   type PostureState,
-  tenantApiPrefix,
-  useCreateComputerAction,
-  useGetBlueTeamDefenseStack,
-  useGetBlueTeamPosture,
-  useGetBlueTeamSoftware,
-  useGetComputers,
-  searchBlueTeamRecords,
 } from "@workspace/api-client-react";
 import {
   AlertTriangle,
+  CheckCircle2,
   ChevronRight,
   Copy,
   Crosshair,
@@ -37,19 +37,46 @@ import {
   ShieldOff,
   ShieldQuestion,
   Usb,
+  XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { PrintButton } from "@/components/print-button";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { formatDateTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -59,12 +86,6 @@ const SEVERITY_VARIANT: Record<PostureSeverity, string> = {
   medium: "warning",
   low: "secondary",
   info: "info",
-};
-
-const STATE_LABEL: Record<PostureState, string> = {
-  pass: "OK",
-  fail: "Failing",
-  unknown: "Not reported",
 };
 
 const CATEGORY_LABEL: Record<string, string> = {
@@ -139,7 +160,7 @@ function SummaryCard({
 }
 
 function DefenseStackSection() {
-  const stack = useGetBlueTeamDefenseStack();
+  const stack = useGetAdminBlueTeamDefenseStack();
   // Supplementary view — never blocks or breaks the page.
   if (stack.isError || !stack.data) return null;
 
@@ -174,9 +195,10 @@ function DefenseStackSection() {
           Defense stack
         </CardTitle>
         <CardDescription>
-          Every defensive layer of this deployment mapped to the SOC blueprint —
-          live status, not promises. Layers marked “not in scope” are the
-          blueprint items this server deliberately does not implement.
+          Every defensive layer of the whole platform mapped to the SOC blueprint —
+          live status, not promises, aggregated across every tenant. Layers marked
+          “not in scope” are the blueprint items this server deliberately does not
+          implement.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3 px-6">
@@ -212,9 +234,14 @@ function DefenseStackSection() {
   );
 }
 
-function MachineStatusBadge({ status }: { status: Computer["status"] }) {
+function MachineStatusBadge({ status }: { status: string }) {
   if (status === "online") {
-    return <Badge variant="success">Online</Badge>;
+    return (
+      <Badge variant="success">
+        <CheckCircle2 className="size-3" />
+        Online
+      </Badge>
+    );
   }
   if (status === "locked") {
     return (
@@ -226,7 +253,8 @@ function MachineStatusBadge({ status }: { status: Computer["status"] }) {
   }
   return (
     <Badge variant="outline" className="text-muted-foreground">
-      {status}
+      <XCircle className="size-3" />
+      {status === "offline" ? "Offline" : status}
     </Badge>
   );
 }
@@ -240,35 +268,49 @@ const lastSeenLabel = (iso: string) => {
 };
 
 /**
- * Machines · VPS — the tenant's own fleet surface on the Blue Team dashboard.
- * Same endpoints as the Computers page, surfaced here so blue team manages the
- * machines/VPSes it protects from this seat: deploy the lvosec agent on a
- * Windows VPS, and firewall / USB / lock / restart / message controls land on
- * this page through the normal agent action queue.
+ * Cloud VPS — the platform-level protection seat. All Linux servers across all
+ * tenants (the lvosec Linux agent), with firewall (ufw), USB, lock, restart and
+ * operator-message controls through the shared agent action queue. Deploying a
+ * new VPS agent targets the tenant whose schema it should enroll into.
  */
-function BlueTeamMachinesSection() {
-  const computersQuery = useGetComputers();
-  const actionMutation = useCreateComputerAction();
+function VpsMachinesSection() {
+  const machinesQuery = useGetAdminMachines();
+  const tenantsQuery = useListAdminTenants();
+  const actionMutation = useRunAdminMachineAction();
+
+  const machines = machinesQuery.data?.machines ?? [];
+  const vpsMachines = machines.filter((machine) => machine.kind === "vps");
+
+  const [busy, setBusy] = useState<string | null>(null);
+  const [restartTarget, setRestartTarget] = useState<PlatformMachine | null>(null);
+  const [messageTarget, setMessageTarget] = useState<PlatformMachine | null>(null);
+  const [messageText, setMessageText] = useState("");
+  const [showDeploy, setShowDeploy] = useState(false);
+  const [deployTenantSlug, setDeployTenantSlug] = useState("");
+
+  const tenants = tenantsQuery.data?.tenants ?? [];
+  const activeTenants = tenants.filter((t) => t.status === "active");
+  const selectedTenant =
+    activeTenants.find((t) => t.slug === deployTenantSlug) ?? activeTenants[0] ?? null;
 
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const serverUrl = `${origin}${tenantApiPrefix().replace(/\/api$/, "")}`;
+  const serverUrl = selectedTenant ? `${origin}/t/${selectedTenant.slug}` : "";
   const installCmd = `$s='${serverUrl}'; iwr "$s/api/agent/download" -OutFile "$env:TEMP\\lab-agent.ps1"; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\\lab-agent.ps1" -ServerUrl $s -Install; Remove-Item "$env:TEMP\\lab-agent.ps1"`;
   const installCmdLinux = `curl -fsSL "${serverUrl}/api/agent/download-linux" -o /tmp/lab-agent-linux.py && sudo python3 /tmp/lab-agent-linux.py --install --server-url "${serverUrl}"`;
 
-  const computers = computersQuery.data ?? [];
-  const [busy, setBusy] = useState<number | null>(null);
-  const [restartId, setRestartId] = useState<number | null>(null);
-  const [messageId, setMessageId] = useState<number | null>(null);
-  const [messageText, setMessageText] = useState("");
-  const [showDeploy, setShowDeploy] = useState(false);
+  const keyOf = (machine: PlatformMachine) => `${machine.tenantId}/${machine.id}`;
+  const isBusy = (machine: PlatformMachine) => busy === keyOf(machine);
 
-  const target = (id: number) => computers.find((c) => c.id === id);
-
-  const run = async (id: number, action: ComputerActionInputAction, message?: string) => {
-    setBusy(id);
+  const run = async (
+    machine: PlatformMachine,
+    action: PlatformMachineAction,
+    message?: string,
+  ) => {
+    setBusy(keyOf(machine));
     try {
       const result = await actionMutation.mutateAsync({
-        computerId: id,
+        tenantId: machine.tenantId,
+        computerId: machine.id,
         data: message ? { action, message } : { action },
       });
       toast.success(result.message ?? `${action.replaceAll("_", " ")} queued`);
@@ -282,24 +324,25 @@ function BlueTeamMachinesSection() {
   };
 
   const confirmRestart = async () => {
-    if (restartId === null) return;
-    const ok = await run(restartId, "restart");
-    if (ok) setRestartId(null);
+    if (!restartTarget) return;
+    const ok = await run(restartTarget, "restart");
+    if (ok) setRestartTarget(null);
   };
 
   const sendMessage = async (event: FormEvent) => {
     event.preventDefault();
-    if (messageId === null) return;
+    if (!messageTarget) return;
     const text = messageText.trim();
     if (!text) return;
-    const ok = await run(messageId, "send_message", text);
+    const ok = await run(messageTarget, "send_message", text);
     if (ok) {
-      setMessageId(null);
+      setMessageTarget(null);
       setMessageText("");
     }
   };
 
   const copyInstall = async () => {
+    if (!installCmd) return;
     try {
       await navigator.clipboard.writeText(installCmd);
       toast.success("Windows command copied");
@@ -309,6 +352,7 @@ function BlueTeamMachinesSection() {
   };
 
   const copyInstallLinux = async () => {
+    if (!installCmdLinux) return;
     try {
       await navigator.clipboard.writeText(installCmdLinux);
       toast.success("Linux command copied");
@@ -317,8 +361,8 @@ function BlueTeamMachinesSection() {
     }
   };
 
-  const onlineCount = computers.filter((c) => c.status === "online").length;
-  const firewallOffCount = computers.filter((c) => c.firewallEnabled === false).length;
+  const onlineCount = vpsMachines.filter((m) => m.status === "online").length;
+  const firewallOffCount = vpsMachines.filter((m) => m.firewallEnabled === false).length;
 
   return (
     <>
@@ -328,19 +372,21 @@ function BlueTeamMachinesSection() {
             <div className="space-y-1">
               <CardTitle className="flex items-center gap-2">
                 <Server className="size-4 text-muted-foreground" />
-                Machines · VPS
+                Cloud VPS protection
               </CardTitle>
               <CardDescription>
-                Manage the machines and VPSes lvosec protects. Install the agent
-                on a Windows PC or VPS and it registers here — then firewall,
-                USB, lock, restart and operator messages run from this page.
-                {computers.length > 0 &&
-                  ` ${computers.length} machines · ${onlineCount} online` +
+                Every Linux server lvosec protects, across all tenants — a
+                separate service from lab computers. Deploy the lvosec Linux
+                agent on a server (Contabo-style Ubuntu/Debian VPS) and firewall,
+                USB, lock, restart and operator messages run from here through
+                the normal agent action queue.
+                {vpsMachines.length > 0 &&
+                  ` ${vpsMachines.length} cloud VPS · ${onlineCount} online` +
                     (firewallOffCount > 0 ? ` · ${firewallOffCount} firewalls OFF` : "")}
               </CardDescription>
             </div>
             <Button variant="outline" size="sm" onClick={() => setShowDeploy(true)}>
-              <Plus className="size-4" /> Add machine
+              <Plus className="size-4" /> Add VPS
             </Button>
           </div>
         </CardHeader>
@@ -349,6 +395,7 @@ function BlueTeamMachinesSection() {
             <TableHeader>
               <TableRow>
                 <TableHead>Machine</TableHead>
+                <TableHead>Tenant</TableHead>
                 <TableHead>IP</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Firewall</TableHead>
@@ -358,35 +405,44 @@ function BlueTeamMachinesSection() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {computersQuery.isLoading ? (
+              {machinesQuery.isLoading ? (
                 Array.from({ length: 3 }).map((_, i) => (
                   <TableRow key={i}>
-                    <TableCell colSpan={7}>
+                    <TableCell colSpan={8}>
                       <Skeleton className="h-8 w-full" />
                     </TableCell>
                   </TableRow>
                 ))
-              ) : computers.length === 0 ? (
+              ) : vpsMachines.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={7}
+                    colSpan={8}
                     className="py-8 text-center text-sm text-muted-foreground"
                   >
-                    No machines connected yet. Deploy the agent on a Windows PC
-                    or VPS and it registers under this account automatically.
+                    No cloud VPS protected yet. Use <strong>Add VPS</strong> to
+                    deploy the lvosec Linux agent onto a server — it registers
+                    into the chosen tenant and appears here automatically.
                   </TableCell>
                 </TableRow>
               ) : (
-                computers.map((machine) => (
-                  <TableRow key={machine.id}>
+                vpsMachines.map((machine) => (
+                  <TableRow key={keyOf(machine)}>
                     <TableCell>
                       <div className="flex flex-col">
-                        <span className="font-medium">{machine.name}</span>
+                        <span className="flex items-center gap-1.5 font-medium">
+                          {machine.name}
+                          <Badge variant="info" className="px-1.5 py-0 text-[10px]">
+                            VPS
+                          </Badge>
+                        </span>
                         <span className="text-xs text-muted-foreground">
-                          {machine.userName ?? "—"} · agent{" "}
+                          {machine.os ?? machine.userName ?? "—"} · agent{" "}
                           {machine.agentVersion ?? "?"}
                         </span>
                       </div>
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {machine.tenantName}
                     </TableCell>
                     <TableCell className="font-mono text-xs">
                       {machine.ipAddress ?? "—"}
@@ -421,9 +477,9 @@ function BlueTeamMachinesSection() {
                           title={machine.status === "locked" ? "Unlock" : "Lock"}
                           aria-label={machine.status === "locked" ? "Unlock" : "Lock"}
                           onClick={() =>
-                            void run(machine.id, machine.status === "locked" ? "unlock" : "lock")
+                            void run(machine, machine.status === "locked" ? "unlock" : "lock")
                           }
-                          disabled={busy === machine.id}
+                          disabled={isBusy(machine)}
                         >
                           {machine.status === "locked" ? (
                             <LockOpen className="size-4" />
@@ -436,8 +492,8 @@ function BlueTeamMachinesSection() {
                           size="sm"
                           title="Restart"
                           aria-label="Restart"
-                          onClick={() => setRestartId(machine.id)}
-                          disabled={busy === machine.id}
+                          onClick={() => setRestartTarget(machine)}
+                          disabled={isBusy(machine)}
                         >
                           <Power className="size-4" />
                         </Button>
@@ -447,9 +503,9 @@ function BlueTeamMachinesSection() {
                           title={machine.usbState === "blocked" ? "Allow USB" : "Block USB"}
                           aria-label="Toggle USB"
                           onClick={() =>
-                            void run(machine.id, machine.usbState === "blocked" ? "allow_usb" : "block_usb")
+                            void run(machine, machine.usbState === "blocked" ? "allow_usb" : "block_usb")
                           }
-                          disabled={busy === machine.id}
+                          disabled={isBusy(machine)}
                         >
                           <Usb className="size-4" />
                         </Button>
@@ -463,9 +519,9 @@ function BlueTeamMachinesSection() {
                           }
                           aria-label="Toggle firewall"
                           onClick={() =>
-                            void run(machine.id, machine.firewallEnabled === true ? "fw_disable" : "fw_enable")
+                            void run(machine, machine.firewallEnabled === true ? "fw_disable" : "fw_enable")
                           }
-                          disabled={busy === machine.id}
+                          disabled={isBusy(machine)}
                         >
                           {machine.firewallEnabled === true ? (
                             <ShieldOff className="size-4" />
@@ -480,13 +536,13 @@ function BlueTeamMachinesSection() {
                           aria-label="Send message"
                           onClick={() => {
                             setMessageText("");
-                            setMessageId(machine.id);
+                            setMessageTarget(machine);
                           }}
-                          disabled={busy === machine.id}
+                          disabled={isBusy(machine)}
                         >
                           <MessageSquare className="size-4" />
                         </Button>
-                        {busy === machine.id ? <Spinner className="size-4" /> : null}
+                        {isBusy(machine) ? <Spinner className="size-4" /> : null}
                       </div>
                     </TableCell>
                   </TableRow>
@@ -500,15 +556,38 @@ function BlueTeamMachinesSection() {
       <Dialog open={showDeploy} onOpenChange={setShowDeploy}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Deploy the agent to a new machine</DialogTitle>
+            <DialogTitle>Deploy the lvosec agent to a new machine</DialogTitle>
             <DialogDescription>
-              Pick the platform, paste the command into the machine's shell,
-              and it registers itself under this account within a minute. The
-              host name becomes the machine name; after that you can toggle
-              firewall &amp; USB, lock, restart or message it from this page.
+              Pick the tenant the machine should enroll into, then paste the
+              command into the machine's shell. The host name becomes the machine
+              name; after that you can toggle firewall &amp; USB, lock, restart or
+              message it from this page.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-2">
+            {activeTenants.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No active tenant yet. Create a tenant first — the agent registers
+                into a tenant's schema, then appears under that tenant here and in
+                Admin → Machines.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                <Label htmlFor="deploy-tenant">Tenant</Label>
+                <select
+                  id="deploy-tenant"
+                  value={selectedTenant?.slug ?? ""}
+                  onChange={(e) => setDeployTenantSlug(e.target.value)}
+                  className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs outline-none transition-colors focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {activeTenants.map((tenant) => (
+                    <option key={tenant.id} value={tenant.slug}>
+                      {tenant.name} (t/{tenant.slug})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
             <div className="space-y-2">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                 Windows — PowerShell (admin)
@@ -552,21 +631,21 @@ function BlueTeamMachinesSection() {
       </Dialog>
 
       <Dialog
-        open={restartId !== null}
+        open={restartTarget !== null}
         onOpenChange={(open) => {
-          if (!open) setRestartId(null);
+          if (!open) setRestartTarget(null);
         }}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Restart {target(restartId ?? -1)?.name ?? ""}?</DialogTitle>
+            <DialogTitle>Restart {restartTarget?.name ?? ""}?</DialogTitle>
             <DialogDescription>
               The machine will reboot on the agent's next poll. Unsaved work will
               be lost.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setRestartId(null)}>
+            <Button variant="outline" onClick={() => setRestartTarget(null)}>
               Cancel
             </Button>
             <Button
@@ -582,24 +661,24 @@ function BlueTeamMachinesSection() {
       </Dialog>
 
       <Dialog
-        open={messageId !== null}
+        open={messageTarget !== null}
         onOpenChange={(open) => {
-          if (!open) setMessageId(null);
+          if (!open) setMessageTarget(null);
         }}
       >
         <DialogContent>
           <form onSubmit={(e) => void sendMessage(e)}>
             <DialogHeader>
-              <DialogTitle>Message {target(messageId ?? -1)?.name ?? ""}</DialogTitle>
+              <DialogTitle>Message {messageTarget?.name ?? ""}</DialogTitle>
               <DialogDescription>
                 The operator message pops up on the machine's screen (shown by
                 the agent).
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-2 py-4">
-              <Label htmlFor="blue-team-machine-message">Message</Label>
+              <Label htmlFor="admin-blue-team-message">Message</Label>
               <Input
-                id="blue-team-machine-message"
+                id="admin-blue-team-message"
                 value={messageText}
                 onChange={(e) => setMessageText(e.target.value)}
                 placeholder="Example: Scheduled maintenance in 10 minutes"
@@ -608,7 +687,7 @@ function BlueTeamMachinesSection() {
               />
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setMessageId(null)}>
+              <Button variant="outline" onClick={() => setMessageTarget(null)}>
                 Cancel
               </Button>
               <Button type="submit" disabled={actionMutation.isPending}>
@@ -623,13 +702,175 @@ function BlueTeamMachinesSection() {
   );
 }
 
-export default function BlueTeam() {
-  const posture = useGetBlueTeamPosture();
+function ComputerRow({
+  computer,
+}: {
+  computer: {
+    tenantName: string;
+    computerId: number;
+    computerName: string;
+    room: string;
+    status: string;
+    os: string | null;
+    summary: {
+      findings: PostureFinding[];
+      evaluated: number;
+      total: number;
+      failing: number;
+      headline: PostureFinding | null;
+    };
+  };
+}) {
+  const [open, setOpen] = useState(false);
+  const summary = computer.summary;
+  const critical = summary.findings.filter((f) => f.state === "fail" && f.severity === "critical").length;
+
+  return (
+    <>
+      <TableRow className="cursor-pointer" onClick={() => setOpen((v) => !v)}>
+        <TableCell>
+          <div className="flex items-center gap-2">
+            <span className={cn("size-2 rounded-full", computer.status === "online" ? "bg-emerald-500" : "bg-muted-foreground/40")} />
+            <span className="font-medium">{computer.computerName}</span>
+          </div>
+          {computer.os ? <p className="text-xs text-muted-foreground">{computer.os}</p> : null}
+        </TableCell>
+        <TableCell className="text-sm text-muted-foreground">{computer.tenantName}</TableCell>
+        <TableCell className="text-muted-foreground">{computer.room}</TableCell>
+        <TableCell className="text-right">
+          {critical > 0 ? (
+            <Badge variant="destructive">{critical} critical</Badge>
+          ) : summary.failing > 0 ? (
+            <Badge variant="warning">{summary.failing}</Badge>
+          ) : (
+            <Badge variant="success">clean</Badge>
+          )}
+        </TableCell>
+        <TableCell className="text-right text-xs tabular-nums text-muted-foreground">
+          {summary.evaluated}/{summary.total}
+        </TableCell>
+        <TableCell>
+          <ChevronRight className={cn("size-4 text-muted-foreground transition-transform", open && "rotate-90")} />
+        </TableCell>
+      </TableRow>
+      {open ? (
+        <TableRow>
+          <TableCell colSpan={6} className="bg-muted/30 p-4">
+            <div className="grid gap-2 lg:grid-cols-2">
+              {summary.findings.map((f) => (
+                <FindingRow key={f.id} finding={f} />
+              ))}
+            </div>
+          </TableCell>
+        </TableRow>
+      ) : null}
+    </>
+  );
+}
+
+function SoftwareInventory() {
+  const inventory = useGetAdminBlueTeamSoftware();
+  const data = inventory.data;
+  const [filter, setFilter] = useState("");
+
+  const lower = filter.trim().toLowerCase();
+  const matches = !data
+    ? []
+    : data.inventories.flatMap((machine) =>
+        machine.software
+          .filter((s) => !lower || s.name.toLowerCase().includes(lower) || machine.tenantName.toLowerCase().includes(lower))
+          .map((s) => ({
+            ...s,
+            computerName: machine.computerName,
+            room: machine.room,
+            tenantName: machine.tenantName,
+          })),
+      );
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Software inventory</CardTitle>
+        <CardDescription>
+          What is installed where, across every tenant. Search to answer the
+          question the whole platform depends on: <em>which machines have this?</em>
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3 px-6">
+        <div className="flex gap-2">
+          <div className="relative flex-1">
+            <Search className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              className="pl-9"
+              placeholder="Filter by software name or tenant, e.g. WinRAR, Python, Zoom…"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+          </div>
+        </div>
+
+        {inventory.isLoading ? (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Spinner className="size-4" /> Loading inventory…
+          </div>
+        ) : !data || data.machines === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No machine has reported an inventory yet. Agents older than 1.22.0
+            do not send one — they pick it up when they self-update.
+          </p>
+        ) : (
+          <>
+            <p className="text-xs text-muted-foreground">
+              {data.machines} machine{data.machines === 1 ? "" : "s"} · {data.totalEntries} programs
+              {lower ? ` · ${matches.length} match${matches.length === 1 ? "" : "es"} for “${filter.trim()}”` : ""}
+            </p>
+            {matches.length > 0 ? (
+              <div className="max-h-96 overflow-y-auto border rounded-lg">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Software</TableHead>
+                      <TableHead>Version</TableHead>
+                      <TableHead>Machine</TableHead>
+                      <TableHead>Room</TableHead>
+                      <TableHead>Tenant</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {matches.slice(0, 200).map((m, i) => (
+                      <TableRow key={`${m.computerName}-${m.tenantName}-${i}`}>
+                        <TableCell className="font-medium">{m.name}</TableCell>
+                        <TableCell className="text-muted-foreground">{m.version ?? "—"}</TableCell>
+                        <TableCell>{m.computerName}</TableCell>
+                        <TableCell className="text-muted-foreground">{m.room}</TableCell>
+                        <TableCell className="text-muted-foreground">{m.tenantName}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">Nothing matches that filter.</p>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Blue Team — the platform-level SOC seat. Defense stack, cloud VPS protection
+ * and posture across every tenant. Replaced the per-tenant Blue Team dashboard
+ * in the comp labs; it now lives only in Platform Admin.
+ */
+export function BlueTeamSection() {
+  const posture = useGetAdminBlueTeamPosture();
   const data = posture.data;
 
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
-  const [hits, setHits] = useState<Awaited<ReturnType<typeof searchBlueTeamRecords>> | null>(null);
+  const [hits, setHits] = useState<Awaited<ReturnType<typeof searchAdminBlueTeamRecords>> | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
 
   const runSearch = async () => {
@@ -638,7 +879,7 @@ export default function BlueTeam() {
     setSearching(true);
     setSearchError(null);
     try {
-      setHits(await searchBlueTeamRecords(q));
+      setHits(await searchAdminBlueTeamRecords(q));
     } catch (err) {
       setSearchError(err instanceof Error ? err.message : "Search failed");
     } finally {
@@ -665,10 +906,11 @@ export default function BlueTeam() {
       <Empty>
         <EmptyHeader>
           <EmptyMedia>💥</EmptyMedia>
-          <EmptyTitle>Could not load security posture</EmptyTitle>
+          <EmptyTitle>Could not load platform security posture</EmptyTitle>
           <EmptyDescription>
-            The posture engine is part of this deployment. If you are seeing this, the
-            server it is running on is older than this dashboard — redeploy and try again.
+            The posture engine is part of this deployment. If you are seeing
+            this, the server it is running on is older than this dashboard —
+            redeploy and try again.
           </EmptyDescription>
         </EmptyHeader>
         <EmptyContent>
@@ -686,22 +928,20 @@ export default function BlueTeam() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Blue Team</h1>
-          <p className="text-sm text-muted-foreground">
-            Security posture, correlation findings and record search — the honest
-            slice of a SOC that runs where the lab does.
-          </p>
-        </div>
-        <PrintButton />
+      <div>
+        <h2 className="text-xl font-bold">Blue Team</h2>
+        <p className="text-sm text-muted-foreground">
+          The SOC seat for the whole platform — defense stack, cloud VPS
+          protection, posture, correlation findings, record search and software
+          inventory across every tenant, in one place.
+        </p>
       </div>
 
       {/* Defense stack — SOC blueprint layers, live status */}
       <DefenseStackSection />
 
-      {/* Machines · VPS — the tenant's own fleet, managed through lvosec */}
-      <BlueTeamMachinesSection />
+      {/* Cloud VPS protection — the platform manages its servers here */}
+      <VpsMachinesSection />
 
       {/* Summary */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
@@ -718,7 +958,7 @@ export default function BlueTeam() {
           <CardTitle>Correlation findings</CardTitle>
           <CardDescription>
             Patterns the individual machine checks cannot show you — whole-fleet
-            waves and compounded failures. {findings.length === 0 ? "Nothing compounding right now." : `${findings.length} active.`}
+            waves and compounded failures, across every tenant. {findings.length === 0 ? "Nothing compounding right now." : `${findings.length} active.`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3 px-6">
@@ -799,7 +1039,8 @@ export default function BlueTeam() {
           <CardHeader>
             <CardTitle>Record search</CardTitle>
             <CardDescription>
-              Search events, actions, alerts and check-ins already recorded in this lab.
+              Search events, actions, alerts and check-ins already recorded in
+              every tenant.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3 px-6">
@@ -827,7 +1068,7 @@ export default function BlueTeam() {
             {hits ? (
               hits.results.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  No records match “{hits.query}” in this lab.
+                  No records match “{hits.query}” in any tenant.
                 </p>
               ) : (
                 <div className="max-h-80 space-y-1 overflow-y-auto pr-1">
@@ -841,7 +1082,8 @@ export default function BlueTeam() {
                       </div>
                       <p className="truncate text-xs text-muted-foreground">{hit.detail}</p>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        {hit.computerName ?? "—"} · {formatDateTime(String(hit.createdAt))}
+                        {hit.tenantName}
+                        {hit.computerName ? ` · ${hit.computerName}` : ""} · {formatDateTime(String(hit.createdAt))}
                       </p>
                     </div>
                   ))}
@@ -857,14 +1099,14 @@ export default function BlueTeam() {
         </Card>
       </div>
 
-      {/* Machines */}
+      {/* Machines — posture by host, across tenants */}
       <Card>
         <CardHeader>
           <CardTitle>Machines</CardTitle>
           <CardDescription>
-            Every computer, with its posture findings. Expand a machine to see what is
-            wrong and what to do about it. Coverage varies — machines running an older agent
-            report fewer checks.
+            Every computer on the platform, with its posture findings. Expand a
+            machine to see what is wrong and what to do about it. Coverage varies —
+            machines running an older agent report fewer checks.
           </CardDescription>
         </CardHeader>
         <CardContent className="px-0 pb-0">
@@ -872,6 +1114,7 @@ export default function BlueTeam() {
             <TableHeader>
               <TableRow>
                 <TableHead>Machine</TableHead>
+                <TableHead>Tenant</TableHead>
                 <TableHead>Room</TableHead>
                 <TableHead className="text-right">Failing</TableHead>
                 <TableHead className="text-right">Coverage</TableHead>
@@ -880,7 +1123,10 @@ export default function BlueTeam() {
             </TableHeader>
             <TableBody>
               {computers.map((computer) => (
-                <ComputerRow key={computer.computerId} computer={computer} />
+                <ComputerRow
+                  key={`${computer.tenantId}/${computer.computerId}`}
+                  computer={computer}
+                />
               ))}
             </TableBody>
           </Table>
@@ -890,153 +1136,5 @@ export default function BlueTeam() {
       {/* Software inventory */}
       <SoftwareInventory />
     </div>
-  );
-}
-
-function SoftwareInventory() {
-  const inventory = useGetBlueTeamSoftware();
-  const data = inventory.data;
-  const [filter, setFilter] = useState("");
-
-  const lower = filter.trim().toLowerCase();
-  const matches = !data
-    ? []
-    : data.inventories.flatMap((machine) =>
-        machine.software
-          .filter((s) => !lower || s.name.toLowerCase().includes(lower))
-          .map((s) => ({ ...s, computerName: machine.computerName, room: machine.room })),
-      );
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Software inventory</CardTitle>
-        <CardDescription>
-          What is installed where. Search to answer the question the whole lab
-          depends on: <em>which machines have this?</em>
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3 px-6">
-        <div className="flex gap-2">
-          <div className="relative flex-1">
-            <Search className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              className="pl-9"
-              placeholder="Filter by software name, e.g. WinRAR, Python, Zoom…"
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-            />
-          </div>
-        </div>
-
-        {inventory.isLoading ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Spinner className="size-4" /> Loading inventory…
-          </div>
-        ) : !data || data.machines === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No machine has reported an inventory yet. Agents older than 1.22.0
-            do not send one — they pick it up when they self-update.
-          </p>
-        ) : (
-          <>
-            <p className="text-xs text-muted-foreground">
-              {data.machines} machine{data.machines === 1 ? "" : "s"} · {data.totalEntries} programs
-              {lower ? ` · ${matches.length} match${matches.length === 1 ? "" : "es"} for “${filter.trim()}”` : ""}
-            </p>
-            {matches.length > 0 ? (
-              <div className="max-h-96 overflow-y-auto border rounded-lg">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Software</TableHead>
-                      <TableHead>Version</TableHead>
-                      <TableHead>Machine</TableHead>
-                      <TableHead>Room</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {matches.slice(0, 200).map((m, i) => (
-                      <TableRow key={`${m.computerName}-${i}`}>
-                        <TableCell className="font-medium">{m.name}</TableCell>
-                        <TableCell className="text-muted-foreground">{m.version ?? "—"}</TableCell>
-                        <TableCell>{m.computerName}</TableCell>
-                        <TableCell className="text-muted-foreground">{m.room}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">Nothing matches that filter.</p>
-            )}
-          </>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function ComputerRow({
-  computer,
-}: {
-  computer: {
-    computerId: number;
-    computerName: string;
-    room: string;
-    status: string;
-    os: string | null;
-    summary: {
-      findings: PostureFinding[];
-      evaluated: number;
-      total: number;
-      failing: number;
-      headline: PostureFinding | null;
-    };
-  };
-}) {
-  const [open, setOpen] = useState(false);
-  const summary = computer.summary;
-  const critical = summary.findings.filter((f) => f.state === "fail" && f.severity === "critical").length;
-
-  return (
-    <>
-      <TableRow className="cursor-pointer" onClick={() => setOpen((v) => !v)}>
-        <TableCell>
-          <div className="flex items-center gap-2">
-            <span className={cn("size-2 rounded-full", computer.status === "online" ? "bg-emerald-500" : "bg-muted-foreground/40")} />
-            <span className="font-medium">{computer.computerName}</span>
-          </div>
-          {computer.os ? <p className="text-xs text-muted-foreground">{computer.os}</p> : null}
-        </TableCell>
-        <TableCell className="text-muted-foreground">{computer.room}</TableCell>
-        <TableCell className="text-right">
-          {critical > 0 ? (
-            <Badge variant="destructive">{critical} critical</Badge>
-          ) : summary.failing > 0 ? (
-            <Badge variant="warning">{summary.failing}</Badge>
-          ) : (
-            <Badge variant="success">clean</Badge>
-          )}
-        </TableCell>
-        <TableCell className="text-right text-xs tabular-nums text-muted-foreground">
-          {summary.evaluated}/{summary.total}
-        </TableCell>
-        <TableCell>
-          <ChevronRight className={cn("size-4 text-muted-foreground transition-transform", open && "rotate-90")} />
-        </TableCell>
-      </TableRow>
-      {open ? (
-        <TableRow>
-          <TableCell colSpan={5} className="bg-muted/30 p-4">
-            <div className="grid gap-2 lg:grid-cols-2">
-              {summary.findings.map((f) => (
-                <FindingRow key={f.id} finding={f} />
-              ))}
-            </div>
-          </TableCell>
-        </TableRow>
-      ) : null}
-    </>
   );
 }
