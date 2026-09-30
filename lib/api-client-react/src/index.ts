@@ -1,5 +1,6 @@
 export * from "./generated/api";
 export * from "./generated/api.schemas";
+export * from "./admin-machines";
 export * from "./blue-team";
 export * from "./db-connections";
 export * from "./reports";

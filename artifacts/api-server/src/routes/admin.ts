@@ -1,9 +1,13 @@
 import { Router, type IRouter } from "express";
 import { asc, eq } from "drizzle-orm";
 import {
+  computersTable,
+  createTenantDb,
   db,
   platformDbConnectionsTable,
   platformUsersTable,
+  pool,
+  schemaNameFor,
   tenantsTable,
   testDbConnection,
   writePlatformSnapshot,
@@ -21,6 +25,10 @@ import {
   DbConnectionTestResponse,
   DbConnectionUpdateBody,
   DbConnectionsListResponse,
+  PlatformMachineActionBody,
+  PlatformMachineActionParams,
+  PlatformMachineActionResponse,
+  PlatformMachinesListResponse,
   PlatformStatsResponse,
   TenantAdminPasswordBody,
   TenantIdParams,
@@ -28,6 +36,7 @@ import {
   TenantStatusUpdateBody,
   type DbConnectionStatus,
   type PlatformDbConnection,
+  type PlatformMachine,
   type TenantListItem,
 } from "@workspace/api-zod";
 import {
@@ -51,6 +60,7 @@ import {
   getTenantSuperAdminUsername,
   resetTenantSuperAdmin,
 } from "../lib/tenant";
+import { queueMachineAction } from "../lib/machine-actions";
 import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
@@ -539,6 +549,135 @@ router.post(
     res.json(
       DbConnectionSnapshotResponse.parse({ ok: true, rows: result.rows, takenAt }),
     );
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Platform-wide Machines — every tenant's computers/servers under one Super
+// Admin dashboard. Network status (IP, MAC, firewall on/off, last seen) plus
+// the same operator controls the tenant lab uses (firewall, USB, lock,
+// restart, message), forwards through the shared queueMachineAction() so
+// behavior is identical to the per-lab dashboard.
+// ---------------------------------------------------------------------------
+
+const mapPlatformMachine = (
+  tenant: { id: number; name: string; slug: string; status: string },
+  computer: typeof computersTable.$inferSelect,
+): PlatformMachine => ({
+  tenantId: tenant.id,
+  tenantName: tenant.name,
+  tenantSlug: tenant.slug,
+  tenantStatus: tenant.status,
+  id: computer.id,
+  name: computer.name,
+  room: computer.room,
+  status: computer.status,
+  userName: computer.userName,
+  lastSeen:
+    computer.lastSeen instanceof Date
+      ? computer.lastSeen.toISOString()
+      : String(computer.lastSeen),
+  os: computer.os,
+  agentVersion: computer.agentVersion,
+  usbState: computer.usbState,
+  avEnabled: computer.avEnabled,
+  firewallEnabled: computer.firewallEnabled,
+  firewallProfiles: computer.firewallProfiles,
+  ipAddress: computer.ipAddress,
+  macAddress: computer.macAddress,
+});
+
+router.get("/admin/machines", async (_req, res): Promise<void> => {
+  const tenants = await db
+    .select()
+    .from(tenantsTable)
+    .orderBy(asc(tenantsTable.id));
+  const client = await pool.connect();
+  const machines: PlatformMachine[] = [];
+  try {
+    for (const tenant of tenants) {
+      try {
+        await client.query(`SET search_path TO "${schemaNameFor(tenant.id)}"`);
+        const tenantDb = createTenantDb(client);
+        const computers = await tenantDb
+          .select()
+          .from(computersTable)
+          .orderBy(asc(computersTable.name));
+        machines.push(...computers.map((c) => mapPlatformMachine(tenant, c)));
+      } catch (err) {
+        // Tenant schemas are provisioned lazily at startup; skip missing ones
+        // so one broken tenant never fails the whole platform view.
+        logger.warn(
+          { tenantId: tenant.id, err },
+          "Skipping machine scan for tenant",
+        );
+      }
+    }
+  } finally {
+    // Never hand a connection back to the pool with a tenant search_path.
+    await client.query("SET search_path TO public").catch(() => {});
+    client.release();
+  }
+  res.json(PlatformMachinesListResponse.parse({ machines }));
+});
+
+router.post(
+  "/admin/machines/:tenantId/:computerId/actions",
+  async (req, res): Promise<void> => {
+    const params = PlatformMachineActionParams.safeParse(req.params);
+    const body = PlatformMachineActionBody.safeParse(req.body);
+    if (!params.success || !body.success) {
+      res.status(400).json({ error: "Invalid machine action" });
+      return;
+    }
+
+    const [tenant] = await db
+      .select()
+      .from(tenantsTable)
+      .where(eq(tenantsTable.id, params.data.tenantId))
+      .limit(1);
+    if (!tenant) {
+      res.status(404).json({ error: "Tenant not found" });
+      return;
+    }
+    if (tenant.status !== "active") {
+      res.status(403).json({ error: "This lab account is suspended" });
+      return;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query(`SET search_path TO "${schemaNameFor(tenant.id)}"`);
+      const tenantDb = createTenantDb(client);
+      const [computer] = await tenantDb
+        .select()
+        .from(computersTable)
+        .where(eq(computersTable.id, params.data.computerId))
+        .limit(1);
+      if (!computer) {
+        res.status(404).json({ error: "Computer not found" });
+        return;
+      }
+
+      const outcome = await queueMachineAction(tenantDb, computer, {
+        action: body.data.action,
+        message: body.data.message ?? null,
+        payload: body.data.payload ?? null,
+        actor: "Platform administrator",
+      });
+      if (!outcome.ok || !outcome.queued) {
+        res
+          .status(outcome.httpStatus)
+          .json({ error: outcome.error ?? "Action failed" });
+        return;
+      }
+      res
+        .status(outcome.httpStatus)
+        .json(PlatformMachineActionResponse.parse(outcome.queued));
+    } finally {
+      await client.query("SET search_path TO public").catch(() => {});
+      client.release();
+    }
   },
 );
 

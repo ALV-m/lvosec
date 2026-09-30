@@ -29,6 +29,10 @@ export interface TenantDbContext {
   tenantId: number;
 }
 
+// Type alias for tenant-scoped drizzle instances (createTenantDb / the `db`
+// proxy). Used by shared path helpers that operate inside one tenant schema.
+export type TenantDbShape = NodePgDatabase<typeof schema>;
+
 export const tenantContext = new AsyncLocalStorage<TenantDbContext>();
 
 export function createTenantDb(
