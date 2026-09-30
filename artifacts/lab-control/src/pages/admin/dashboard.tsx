@@ -16,7 +16,6 @@ import {
   ExternalLink,
   KeyRound,
   Link as LinkIcon,
-  LogOut,
   Monitor,
   Server,
   ShieldCheck,
@@ -56,10 +55,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useAdminAuth } from "@/lib/admin-auth";
-import { DbManagementSection } from "./db-management";
-import { MachinesSection } from "./machines";
-import { BlueTeamSection } from "./blue-team";
 
 function StatCard({
   icon: Icon,
@@ -292,8 +287,7 @@ function DeleteTenantDialog({
   );
 }
 
-function AdminDashboard() {
-  const { admin, signOut } = useAdminAuth();
+function TenantsPage() {
   const tenantsQuery = useListAdminTenants();
   const statsQuery = useGetAdminStats();
   const [resetTarget, setResetTarget] = useState<TenantListItem | null>(null);
@@ -311,36 +305,8 @@ function AdminDashboard() {
   const tenants = useMemo(() => tenantsQuery.data?.tenants ?? [], [tenantsQuery.data]);
 
   return (
-    <div className="min-h-screen bg-background">
-      <header className="sticky top-0 z-10 border-b bg-card">
-        <div className="flex h-16 items-center justify-between gap-4 px-4 md:px-6">
-          <div className="flex items-center gap-2.5">
-            <div className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
-              <Server className="size-4" />
-            </div>
-            <div className="leading-tight">
-              <p className="text-sm font-bold">Platform Admin</p>
-              <p className="text-[11px] text-muted-foreground">
-                LVO Security
-              </p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            {admin ? (
-              <span className="hidden text-sm text-muted-foreground sm:block">
-                {admin.username}
-              </span>
-            ) : null}
-            <Button variant="ghost" size="sm" onClick={() => void signOut()}>
-              <LogOut className="size-4" />
-              Sign out
-            </Button>
-          </div>
-        </div>
-      </header>
-
-      <main className="space-y-6 p-4 md:p-6 lg:p-8">
-        <div className="flex flex-col gap-1">
+    <div className="space-y-6">
+      <div className="flex flex-col gap-1">
           <h1 className="text-2xl font-bold">Tenants</h1>
           <p className="text-sm text-muted-foreground">
             Manage the computer labs running on this platform.
@@ -453,17 +419,10 @@ function AdminDashboard() {
           </CardContent>
         </Card>
 
-        <DbManagementSection />
-
-        <MachinesSection />
-
-        <BlueTeamSection />
-      </main>
-
       <ResetPasswordDialog tenant={resetTarget} onOpenChange={(open) => { if (!open) setResetTarget(null); }} />
       <DeleteTenantDialog tenant={deleteTarget} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }} />
     </div>
   );
 }
 
-export default AdminDashboard;
+export default TenantsPage;
