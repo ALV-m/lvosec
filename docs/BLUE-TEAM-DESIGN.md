@@ -10,7 +10,7 @@
 > | §7 correlation rules (waves + compounding) + IOC record search | ✅ shipped in PR #3 |
 > | WAF-lite + software inventory + Cloudflare edge rules | ✅ shipped in PR #4 (`feat/waf-inventory`), agent 1.22.0 |
 > | Render service rename (agent `server_url_rotate`) | ✅ shipped in PR #5 (`infra/render-rename`), agent 1.23.0 — runbook: `docs/RENDER-RENAME.md` |
-> | §6 FIM / defence-evasion | ⏳ next — see §6 |
+> | Platform Admin sidebar + VPS Blue Team (services, brute-force, FIM-lite, patch risk, VPS correlation) | ✅ shipped in PR #11 (`feat/admin-sidebar-vps-bluteam`), agent 1.24.0 — see §12 |
 >
 > Where this doc says "new table" for findings (§5.1), the shipped engine
 > computes posture **on the fly** from `lab_computers.security_signals` +
@@ -488,21 +488,26 @@ event appears, then let it roll.
 ## 12. SOC blueprint → shipped mapping (Defense Stack)
 
 The **Blue Team seat moved to the Platform Admin dashboard** (Platform Admin →
-Blue Team); the per-tenant comp lab no longer shows it. It leads with a
-**Defense Stack** view — one live-status card per defensive layer of the
-enterprise SOC blueprint, aggregated across every tenant — plus a **Cloud VPS
-protection** section, making the Blue Team seat the one used to protect
-machines and VPSes platform-wide.
+Blue Team); the per-tenant comp lab no longer shows it. Platform Admin now has
+a **sidebar menu** routing to four pages — Tenants, Databases, Machines,
+Blue Team — replacing the old one-long-scroll dashboard (PR #11). Blue Team
+leads with a **Defense Stack** view — one live-status card per defensive layer
+of the enterprise SOC blueprint, aggregated across every tenant — plus a
+**Cloud VPS protection** section, making the Blue Team seat the one used to
+protect machines and VPSes platform-wide.
 
 ### 12.1 Layer mapping — what is real here
 
 | Blueprint layer | Status here | How it is surfaced |
 | --- | --- | --- |
 | 1. Perimeter & WAF | ✅ Shipped | WAF-lite at the edge: abusive methods, scanner user-agents, Cloudflare-geo allowlist (`WAF_ALLOW_COUNTRIES`, fail-closed when set), `x-waf` header. Stack card reads the same env `app.ts` mounts with. |
-| 2. Detection & correlation | ✅ Shipped | Posture engine + `correlateLab` wave/compounding findings + IOC record search over events/actions/alerts/checkins. Stack shows open-findings count. |
+| 1b. Brute-force & rate limiting | ✅ Shipped (VPS) | Linux agent reports sshd "Failed password" counts + top sources on the hourly telemetry channel; `fw_limit_ssh` / `fw_unlimit_ssh` apply `ufw limit 22/tcp` (~6 new conns/30s per source). `vps_authfail` posture check (threshold 10/24h) + `brute_force` stack card. |
+| 2. Detection & correlation | ✅ Shipped | Posture engine + `correlateLab` wave/compounding findings + `correlateVpsTelemetry` (brute-force spike, brute-force+FIM-drift ⇒ possible intrusion, EOL fleet) + IOC record search over events/actions/alerts/checkins. Stack shows open-findings count. |
 | 3. IDS/IPS — DPI, TLS MITM, portspoof, port-knocking | ⛔ Out of scope | Needs network-layer reach the agent cannot give. Labeled “not in scope” on the stack. |
-| 4. Asset inventory | ✅ Shipped | Software inventory on the 1-hour channel + hardware fingerprint per computer. Stack shows inventoried-machine and entry counts. |
-| 5. Server hardening & host mgmt | ✅ Shipped | Posture checks per host + the Blue Team **Cloud VPS protection** section. |
+| 4. Asset inventory | ✅ Shipped | Software inventory on the 1-hour channel (Windows) + dpkg package inventory on the Linux hourly channel + hardware fingerprint per computer. Stack shows inventoried-machine and entry counts. |
+| 4b. Endpoint integrity (FIM-lite) | ✅ Shipped (VPS) | Linux agent sha-256 baseline of sshd/account/boot/web-server configs (`/etc/lvosec/fim.json`); drift ⇒ `vps_fim_drift` high finding + `fim` stack card. |
+| 4c. Patch risk from inventory | ✅ Shipped (VPS) | Curated end-of-life marker list (openssl 1.1.1, bash 4.x, php 7/8.0/8.1, python3 3.6–3.8) checked against the dpkg inventory ⇒ `vps_vuln_packages` + `patch` stack card. |
+| 5. Server hardening & host mgmt | ✅ Shipped | Posture checks per host + the Blue Team **Cloud VPS protection** section, incl. per-service systemd controls (`services` stack card). |
 | 6. Database audit & management | ✅ Shipped | Super Admin DB registry, health checks, manual per-target snapshots (`docs/DB-MANAGEMENT.md`). Stack shows registry totals. |
 | 7. DLP / PAM/DAM / data masking / air-gap | ⛔ Out of scope | Declined; labeled honestly on the stack. |
 
@@ -525,13 +530,24 @@ Computers page has:
   `docs/VPS-AGENT.md`) — plus a **tenant picker**, because the agent enrolls
   into a tenant schema. Run it on the machine; it registers under that tenant
   and shows up here within a minute.
-- Columns: machine + OS/signed-in user + agent version, **tenant**, public
-  **IP**, status (`online` / `locked` / `offline`), **firewall** On/Off/? from
-  the heartbeat, **USB** policy, last seen.
+- Columns: machine + OS/signed-in user + agent version **+ Brute / FIM / Patch /
+  SSH-limited telemetry badges**, **tenant**, public **IP**, status (`online` /
+  `locked` / `offline`), **firewall** On/Off/? from the heartbeat, **USB**
+  policy, last seen, and a **Services** column.
+- **Services** column expands a per-VPS panel: the hourly telemetry's systemd
+  inventory (service name, active/sub state, boot enablement) with
+  per-service `start` / `stop` / `restart` / `enable` / `disable` buttons, a
+  patch-risk summary, brute-force counts with top source IPs, the FIM drift
+  state, and an **SSH rate-limit** toggle (`fw_limit_ssh` / `fw_unlimit_ssh`).
 - Controls: `lock`/`unlock`, `restart` (confirmation), `block_usb`/`allow_usb`
-  toggle, `fw_enable`/`fw_disable` toggle, `send_message` with text — all
-  through `queueMachineAction` (via `POST /api/admin/machines/:tenantId/:computerId/actions`),
-  audited with actor in `lab_events`, identical behavior to the Computers page.
+  toggle, `fw_enable`/`fw_disable` toggle, `send_message` with text, plus the
+  service and rate-limit actions above — all through `queueMachineAction` (via
+  `POST /api/admin/machines/:tenantId/:computerId/actions`), audited with actor
+  in `lab_events`, identical behavior to the Computers page.
+- Linux agent (≥ 1.24.0) pushes **hourly telemetry** (`POST /api/agent/telemetry`):
+  services, dpkg packages, sshd failed-password counts, and a sha-256 FIM
+  baseline (`/etc/lvosec/fim.json`); `sshRateLimited` rides the heartbeat. All
+  fields optional — absent data reads as `unknown` posture, never a fake pass.
 
 Posture, correlation findings, record search and software inventory are
 also platform-wide (`/api/admin/blue-team/posture`,

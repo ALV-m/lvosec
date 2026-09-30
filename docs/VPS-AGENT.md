@@ -2,9 +2,12 @@
 
 The **Blue Team** seat lives in the **Platform Admin dashboard** — it is the
 platform-level place for protecting machines and VPSes through lvosec. Install
-an agent on a VPS and it registers under a tenant, then firewall, USB, lock,
-restart and operator message controls run from **Platform Admin → Blue Team →
-Cloud VPS protection** (platform-wide across every tenant).
+an agent on a VPS and it registers under a tenant, then firewall, USB, SSH
+rate limiting, lock, restart, service management and operator message controls
+run from **Platform Admin → Blue Team → Cloud VPS protection** (platform-wide
+across every tenant). Expand a VPS row to see its systemd services with
+per-service Start/Stop/Restart/Enable/Disable, plus failed-login, config
+integrity (FIM) and patch-risk telemetry.
 
 Two agents speak the same protocol and appear in the same view:
 
@@ -66,6 +69,8 @@ What the install does:
 | Restart | `restart` — reboots after a grace period with an on-screen reason (60s via `shutdown -r +1` on Linux). |
 | Send message | `send_message` — shows an operator banner on the machine's screen (broadcast with **wall** on Linux). |
 | Wake | WoL magic-packet relay for offline machines (broadcast UDP port 9). |
+| Rate-limit SSH | `fw_limit_ssh` / `fw_unlimit_ssh` — Linux only: `ufw limit 22/tcp` caps SSH at ~6 new connections per 30 seconds per source (the basic brute-force damper). Blue Team shows the current state from the agent's `sshRateLimited` heartbeat signal. |
+| Service controls | `service_start / service_stop / service_restart / service_enable / service_disable` — Linux only: runs `systemctl <verb> <service>` with the service name passed in the action payload. |
 
 Every control goes through the same `queueMachineAction` pipeline as the lab:
 queued → sent → acknowledged, with each action appended to that account's
@@ -93,9 +98,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\lab-agent.ps1" -S
   (`server_url_rotate`), so install with an `https://` URL from the start.
 - Firewall state shows as **?** until the first heartbeat carries
   `security_signals` (agent ≥ 1.23.0).
-- Software inventory (the 1-hour channel) is Windows-only today — Linux assets
-  show up under posture/firewall/USB but not yet in the installed-software
-  list.
+
+## The Linux agent's hourly telemetry channel (agent ≥ 1.24.0)
+
+Blue Team's VPS protection is driven by a dedicated `POST /api/agent/telemetry`
+push on a one-hour timer (kept off the 10-second heartbeat). Each field is
+optional — older agents simply don't send it, and the engine reports the
+check as **unknown** rather than inventing a pass:
+
+| Report | What the agent sends | Seen in Blue Team as |
+| --- | --- | --- |
+| `services` | systemd `list-unit-files` + `list-units` (name, active state, sub-state, boot enablement), capped at 400 entries | the expandable **Services** panel per VPS: each service has Start/Stop/Restart/Enable/Disable |
+| `packages` | `dpkg-query -W` inventory (name + version), capped at 3000 | the **Patch** badge — flagged when a package matches the curated end-of-life marker list (openssl 1.1.1, bash 4.x, php 7/8.0/8.1, python3 3.6–3.8) |
+| `authFailures` | sshd "Failed password" lines from the current auth log (+ journald fallback), counted with top source IPs — roughly the last 24h before rotation | the **Brute** badge and the posture/correlation checks (threshold 10 failed logins/24h) |
+| `fim` | sha-256 hashes of `sshd_config`, `/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, `/etc/crontab`, the agent + unit files, and (when present) nginx/apache/ufw/iptables configs. The first run writes the baseline to `/etc/lvosec/fim.json`; later runs report drift | the **FIM** badge + `vps_fim_drift` finding; combined with a brute-force spike on the same host this escalates to a *possible active intrusion* correlation finding |
+
+- Firewall rate-limiting state (`sshRateLimited`) rides on the heartbeat so the
+  rate-limit toggle button always knows whether to apply or remove the rule.
+- Software inventory (the installed-software view) remains Windows-only today;
+  the Linux package inventory feeds the VPS patch checks instead.
 - On a Linux machine the posture engine only marks checks **unknown** when a
   Windows-specific signal is missing — it never invents a failure.
 - VPS vs computer classification is derived from the reported OS
