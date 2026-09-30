@@ -2,6 +2,7 @@ import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { AsyncLocalStorage } from "node:async_hooks";
 import pg from "pg";
 import * as schema from "./schema";
+import { resolvePgSsl } from "./pg-ssl";
 
 const { Pool } = pg;
 
@@ -11,7 +12,13 @@ if (!process.env.DATABASE_URL) {
   );
 }
 
-export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// Managed DBs (Render/Neon/Supabase) enforce TLS in production; local dev
+// stays plaintext. See ./pg-ssl for the resolution rules.
+const databaseUrl = process.env.DATABASE_URL;
+export const pool = new Pool({
+  connectionString: databaseUrl,
+  ...resolvePgSsl(databaseUrl, process.env.NODE_ENV === "production"),
+});
 
 // ---------------------------------------------------------------------------
 // Tenant-scoped database access
