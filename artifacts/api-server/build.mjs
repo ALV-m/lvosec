@@ -118,6 +118,13 @@ globalThis.__dirname = __bannerPath.dirname(globalThis.__filename);
     path.resolve(artifactDir, "src/assets/lab-agent.ps1"),
     path.resolve(distDir, "lab-agent.ps1"),
   );
+
+  // Bundle the Linux agent so Ubuntu/Debian VPSes can install from
+  // /api/agent/download-linux.
+  await copyFile(
+    path.resolve(artifactDir, "src/assets/lab-agent-linux.py"),
+    path.resolve(distDir, "lab-agent-linux.py"),
+  );
 }
 
 buildAll().catch((err) => {

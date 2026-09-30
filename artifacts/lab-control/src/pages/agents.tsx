@@ -6,7 +6,7 @@ import {
   useGetLabSettings,
   useUpdateLabSettings,
 } from "@workspace/api-client-react";
-import { Copy, Download, ExternalLink, KeyRound, Play, Save, Terminal, Timer, UserCog, UserRound } from "lucide-react";
+import { Copy, Download, ExternalLink, KeyRound, Play, Save, Server, Terminal, Timer, UserCog, UserRound } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -51,6 +51,7 @@ function Agents() {
   const downloadUrl = `${origin}${downloadPath}`;
   const installCmd = `$s='${serverUrl}'; iwr "$s/api/agent/download" -OutFile "$env:TEMP\\lab-agent.ps1"; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\\lab-agent.ps1" -ServerUrl $s -Install`;
   const runCmd = `powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\\lab-agent.ps1" -ServerUrl ${serverUrl}`;
+  const installCmdLinux = `curl -fsSL "${serverUrl}/api/agent/download-linux" -o /tmp/lab-agent-linux.py && sudo python3 /tmp/lab-agent-linux.py --install --server-url "${serverUrl}"`;
 
   const { data: settings } = useGetLabSettings({
     query: { queryKey: getLabSettingsQueryKey(), refetchInterval: 30_000 },
@@ -194,6 +195,37 @@ function Agents() {
           <div className="space-y-2">
             <p className="text-sm font-medium">Download the script only</p>
             <CodeBlock>{downloadUrl}</CodeBlock>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Server className="size-4" />
+            Linux servers &amp; VPSes (Ubuntu, Contabo-style)
+          </CardTitle>
+          <CardDescription>
+            A Python 3 companion agent for Ubuntu/Debian VPSes — same protocol,
+            same dashboard. Run this on the VPS with an administrator shell.
+            It installs a systemd service that phones home on your account.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <p className="text-sm font-medium">Install (recommended)</p>
+            <CodeBlock>{installCmdLinux}</CodeBlock>
+            <p className="text-xs text-muted-foreground">
+              Requires Python 3 (preinstalled on Ubuntu) and systemd. Firewall
+              controls use ufw, USB blocking uses a udev rule, messages
+              broadcast with wall, and the agent self-updates from the server.
+              Uninstall with{" "}
+              <code className="font-mono text-xs">
+                sudo python3 /usr/local/lib/lvosec/lab-agent-linux.py
+                --uninstall
+              </code>
+              .
+            </p>
           </div>
         </CardContent>
       </Card>

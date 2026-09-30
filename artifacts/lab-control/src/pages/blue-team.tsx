@@ -1,28 +1,51 @@
-import { useState } from "react";
+import { useState, type FormEvent } from "react";
 import {
+  type Computer,
+  type ComputerActionInputAction,
+  type DefenseLayer,
+  type DefenseLayerState,
   type LabFinding,
   type PostureFinding,
   type PostureSeverity,
   type PostureState,
+  tenantApiPrefix,
+  useCreateComputerAction,
+  useGetBlueTeamDefenseStack,
   useGetBlueTeamPosture,
   useGetBlueTeamSoftware,
+  useGetComputers,
   searchBlueTeamRecords,
 } from "@workspace/api-client-react";
 import {
   AlertTriangle,
   ChevronRight,
+  Copy,
   Crosshair,
   Database,
+  Globe,
+  Layers,
+  Lock,
+  LockOpen,
+  MessageSquare,
+  Plus,
+  Power,
   Radar,
   Search,
+  Server,
+  Shield,
   ShieldCheck,
+  ShieldOff,
   ShieldQuestion,
+  Usb,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -115,6 +138,491 @@ function SummaryCard({
   );
 }
 
+function DefenseStackSection() {
+  const stack = useGetBlueTeamDefenseStack();
+  // Supplementary view — never blocks or breaks the page.
+  if (stack.isError || !stack.data) return null;
+
+  const stateBadge: Record<DefenseLayerState, string> = {
+    active: "On",
+    warning: "Attention",
+    off: "Off",
+    na: "Not in scope",
+  };
+
+  const stateClass: Record<DefenseLayerState, string> = {
+    active: "border-emerald-500/40 bg-emerald-500/5",
+    warning: "border-amber-500/40 bg-amber-500/5",
+    off: "border-border bg-muted/40",
+    na: "border-dashed border-border bg-transparent",
+  };
+
+  const layerIcon: Record<string, React.ReactNode> = {
+    perimeter: <Globe className="size-4 text-muted-foreground" />,
+    detection: <Crosshair className="size-4 text-muted-foreground" />,
+    hosts: <ShieldCheck className="size-4 text-muted-foreground" />,
+    assets: <Database className="size-4 text-muted-foreground" />,
+    databases: <Database className="size-4 text-muted-foreground" />,
+    data: <Lock className="size-4 text-muted-foreground" />,
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Layers className="size-4 text-muted-foreground" />
+          Defense stack
+        </CardTitle>
+        <CardDescription>
+          Every defensive layer of this deployment mapped to the SOC blueprint —
+          live status, not promises. Layers marked “not in scope” are the
+          blueprint items this server deliberately does not implement.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3 px-6">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {stack.data.layers.map((layer) => (
+            <div
+              key={layer.id}
+              className={cn(
+                "flex flex-col gap-1.5 rounded-lg border p-3",
+                stateClass[layer.state],
+              )}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                  {layerIcon[layer.id] ?? null}
+                  <span className="truncate">{layer.label}</span>
+                </span>
+                <Badge variant="outline" className="shrink-0 capitalize">
+                  {stateBadge[layer.state]}
+                </Badge>
+              </div>
+              <p className="text-xs text-muted-foreground">{layer.detail}</p>
+            </div>
+          ))}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Blueprint items deliberately out of scope here: packet IDS/IPS &amp;
+          deep packet inspection, TLS inspection, portspoof &amp; port-knocking,
+          impossible travel, PAM/DAM, data masking and air-gapped backups.
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
+function MachineStatusBadge({ status }: { status: Computer["status"] }) {
+  if (status === "online") {
+    return <Badge variant="success">Online</Badge>;
+  }
+  if (status === "locked") {
+    return (
+      <Badge variant="warning">
+        <Lock className="size-3" />
+        Locked
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="text-muted-foreground">
+      {status}
+    </Badge>
+  );
+}
+
+const lastSeenLabel = (iso: string) => {
+  const delta = Date.now() - new Date(iso).getTime();
+  if (delta < 60_000) return "just now";
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}h ago`;
+  return new Date(iso).toLocaleDateString();
+};
+
+/**
+ * Machines · VPS — the tenant's own fleet surface on the Blue Team dashboard.
+ * Same endpoints as the Computers page, surfaced here so blue team manages the
+ * machines/VPSes it protects from this seat: deploy the lvosec agent on a
+ * Windows VPS, and firewall / USB / lock / restart / message controls land on
+ * this page through the normal agent action queue.
+ */
+function BlueTeamMachinesSection() {
+  const computersQuery = useGetComputers();
+  const actionMutation = useCreateComputerAction();
+
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const serverUrl = `${origin}${tenantApiPrefix().replace(/\/api$/, "")}`;
+  const installCmd = `$s='${serverUrl}'; iwr "$s/api/agent/download" -OutFile "$env:TEMP\\lab-agent.ps1"; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\\lab-agent.ps1" -ServerUrl $s -Install; Remove-Item "$env:TEMP\\lab-agent.ps1"`;
+  const installCmdLinux = `curl -fsSL "${serverUrl}/api/agent/download-linux" -o /tmp/lab-agent-linux.py && sudo python3 /tmp/lab-agent-linux.py --install --server-url "${serverUrl}"`;
+
+  const computers = computersQuery.data ?? [];
+  const [busy, setBusy] = useState<number | null>(null);
+  const [restartId, setRestartId] = useState<number | null>(null);
+  const [messageId, setMessageId] = useState<number | null>(null);
+  const [messageText, setMessageText] = useState("");
+  const [showDeploy, setShowDeploy] = useState(false);
+
+  const target = (id: number) => computers.find((c) => c.id === id);
+
+  const run = async (id: number, action: ComputerActionInputAction, message?: string) => {
+    setBusy(id);
+    try {
+      const result = await actionMutation.mutateAsync({
+        computerId: id,
+        data: message ? { action, message } : { action },
+      });
+      toast.success(result.message ?? `${action.replaceAll("_", " ")} queued`);
+      return true;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Action failed");
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const confirmRestart = async () => {
+    if (restartId === null) return;
+    const ok = await run(restartId, "restart");
+    if (ok) setRestartId(null);
+  };
+
+  const sendMessage = async (event: FormEvent) => {
+    event.preventDefault();
+    if (messageId === null) return;
+    const text = messageText.trim();
+    if (!text) return;
+    const ok = await run(messageId, "send_message", text);
+    if (ok) {
+      setMessageId(null);
+      setMessageText("");
+    }
+  };
+
+  const copyInstall = async () => {
+    try {
+      await navigator.clipboard.writeText(installCmd);
+      toast.success("Windows command copied");
+    } catch {
+      toast.error("Could not copy — select the command manually");
+    }
+  };
+
+  const copyInstallLinux = async () => {
+    try {
+      await navigator.clipboard.writeText(installCmdLinux);
+      toast.success("Linux command copied");
+    } catch {
+      toast.error("Could not copy — select the command manually");
+    }
+  };
+
+  const onlineCount = computers.filter((c) => c.status === "online").length;
+  const firewallOffCount = computers.filter((c) => c.firewallEnabled === false).length;
+
+  return (
+    <>
+      <Card>
+        <CardHeader className="gap-3">
+          <div className="flex flex-row items-start justify-between gap-4 space-y-0">
+            <div className="space-y-1">
+              <CardTitle className="flex items-center gap-2">
+                <Server className="size-4 text-muted-foreground" />
+                Machines · VPS
+              </CardTitle>
+              <CardDescription>
+                Manage the machines and VPSes lvosec protects. Install the agent
+                on a Windows PC or VPS and it registers here — then firewall,
+                USB, lock, restart and operator messages run from this page.
+                {computers.length > 0 &&
+                  ` ${computers.length} machines · ${onlineCount} online` +
+                    (firewallOffCount > 0 ? ` · ${firewallOffCount} firewalls OFF` : "")}
+              </CardDescription>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => setShowDeploy(true)}>
+              <Plus className="size-4" /> Add machine
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Machine</TableHead>
+                <TableHead>IP</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Firewall</TableHead>
+                <TableHead>USB</TableHead>
+                <TableHead>Last seen</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {computersQuery.isLoading ? (
+                Array.from({ length: 3 }).map((_, i) => (
+                  <TableRow key={i}>
+                    <TableCell colSpan={7}>
+                      <Skeleton className="h-8 w-full" />
+                    </TableCell>
+                  </TableRow>
+                ))
+              ) : computers.length === 0 ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={7}
+                    className="py-8 text-center text-sm text-muted-foreground"
+                  >
+                    No machines connected yet. Deploy the agent on a Windows PC
+                    or VPS and it registers under this account automatically.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                computers.map((machine) => (
+                  <TableRow key={machine.id}>
+                    <TableCell>
+                      <div className="flex flex-col">
+                        <span className="font-medium">{machine.name}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {machine.userName ?? "—"} · agent{" "}
+                          {machine.agentVersion ?? "?"}
+                        </span>
+                      </div>
+                    </TableCell>
+                    <TableCell className="font-mono text-xs">
+                      {machine.ipAddress ?? "—"}
+                    </TableCell>
+                    <TableCell>
+                      <MachineStatusBadge status={machine.status} />
+                    </TableCell>
+                    <TableCell>
+                      {machine.firewallEnabled === true ? (
+                        <Badge variant="success">On</Badge>
+                      ) : machine.firewallEnabled === false ? (
+                        <Badge variant="destructive">Off</Badge>
+                      ) : (
+                        <Badge variant="outline">?</Badge>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <Badge
+                        variant={machine.usbState === "blocked" ? "info" : "warning"}
+                      >
+                        {machine.usbState}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {lastSeenLabel(machine.lastSeen)}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex items-center justify-end gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title={machine.status === "locked" ? "Unlock" : "Lock"}
+                          aria-label={machine.status === "locked" ? "Unlock" : "Lock"}
+                          onClick={() =>
+                            void run(machine.id, machine.status === "locked" ? "unlock" : "lock")
+                          }
+                          disabled={busy === machine.id}
+                        >
+                          {machine.status === "locked" ? (
+                            <LockOpen className="size-4" />
+                          ) : (
+                            <Lock className="size-4" />
+                          )}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title="Restart"
+                          aria-label="Restart"
+                          onClick={() => setRestartId(machine.id)}
+                          disabled={busy === machine.id}
+                        >
+                          <Power className="size-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title={machine.usbState === "blocked" ? "Allow USB" : "Block USB"}
+                          aria-label="Toggle USB"
+                          onClick={() =>
+                            void run(machine.id, machine.usbState === "blocked" ? "allow_usb" : "block_usb")
+                          }
+                          disabled={busy === machine.id}
+                        >
+                          <Usb className="size-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title={
+                            machine.firewallEnabled === true
+                              ? "Disable firewall"
+                              : "Enable firewall"
+                          }
+                          aria-label="Toggle firewall"
+                          onClick={() =>
+                            void run(machine.id, machine.firewallEnabled === true ? "fw_disable" : "fw_enable")
+                          }
+                          disabled={busy === machine.id}
+                        >
+                          {machine.firewallEnabled === true ? (
+                            <ShieldOff className="size-4" />
+                          ) : (
+                            <Shield className="size-4" />
+                          )}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title="Send message"
+                          aria-label="Send message"
+                          onClick={() => {
+                            setMessageText("");
+                            setMessageId(machine.id);
+                          }}
+                          disabled={busy === machine.id}
+                        >
+                          <MessageSquare className="size-4" />
+                        </Button>
+                        {busy === machine.id ? <Spinner className="size-4" /> : null}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+
+      <Dialog open={showDeploy} onOpenChange={setShowDeploy}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Deploy the agent to a new machine</DialogTitle>
+            <DialogDescription>
+              Pick the platform, paste the command into the machine's shell,
+              and it registers itself under this account within a minute. The
+              host name becomes the machine name; after that you can toggle
+              firewall &amp; USB, lock, restart or message it from this page.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <div className="space-y-2">
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Windows — PowerShell (admin)
+              </p>
+              <div className="flex items-center justify-between gap-2 rounded-md border bg-muted px-3 py-2">
+                <code className="min-w-0 flex-1 truncate font-mono text-xs">
+                  {installCmd}
+                </code>
+                <Button variant="ghost" size="sm" onClick={() => void copyInstall()}>
+                  <Copy className="size-4" /> Copy
+                </Button>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Linux — Ubuntu / Debian VPS (Contabo-style)
+              </p>
+              <div className="flex items-center justify-between gap-2 rounded-md border bg-muted px-3 py-2">
+                <code className="min-w-0 flex-1 truncate font-mono text-xs">
+                  {installCmdLinux}
+                </code>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void copyInstallLinux()}
+                >
+                  <Copy className="size-4" /> Copy
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Installs a systemd service with Python 3 (preinstalled on
+                Ubuntu). Firewall controls use ufw, USB blocking uses a udev
+                rule, messages broadcast with wall.
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button onClick={() => setShowDeploy(false)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={restartId !== null}
+        onOpenChange={(open) => {
+          if (!open) setRestartId(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Restart {target(restartId ?? -1)?.name ?? ""}?</DialogTitle>
+            <DialogDescription>
+              The machine will reboot on the agent's next poll. Unsaved work will
+              be lost.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRestartId(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => void confirmRestart()}
+              disabled={actionMutation.isPending}
+            >
+              {actionMutation.isPending ? <Spinner className="size-4" /> : null}
+              Restart
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={messageId !== null}
+        onOpenChange={(open) => {
+          if (!open) setMessageId(null);
+        }}
+      >
+        <DialogContent>
+          <form onSubmit={(e) => void sendMessage(e)}>
+            <DialogHeader>
+              <DialogTitle>Message {target(messageId ?? -1)?.name ?? ""}</DialogTitle>
+              <DialogDescription>
+                The operator message pops up on the machine's screen (shown by
+                the agent).
+              </DialogDescription>
+            </DialogHeader>
+            <div className="grid gap-2 py-4">
+              <Label htmlFor="blue-team-machine-message">Message</Label>
+              <Input
+                id="blue-team-machine-message"
+                value={messageText}
+                onChange={(e) => setMessageText(e.target.value)}
+                placeholder="Example: Scheduled maintenance in 10 minutes"
+                autoFocus
+                required
+              />
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setMessageId(null)}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={actionMutation.isPending}>
+                {actionMutation.isPending ? <Spinner className="size-4" /> : null}
+                Send
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
 export default function BlueTeam() {
   const posture = useGetBlueTeamPosture();
   const data = posture.data;
@@ -188,6 +696,12 @@ export default function BlueTeam() {
         </div>
         <PrintButton />
       </div>
+
+      {/* Defense stack — SOC blueprint layers, live status */}
+      <DefenseStackSection />
+
+      {/* Machines · VPS — the tenant's own fleet, managed through lvosec */}
+      <BlueTeamMachinesSection />
 
       {/* Summary */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">

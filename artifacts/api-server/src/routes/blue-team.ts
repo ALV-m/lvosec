@@ -1,9 +1,8 @@
 import { Router, type IRouter } from "express";
 import { eq, ilike, or, desc } from "drizzle-orm";
-import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { db } from "@workspace/db";
+import { db, pool } from "@workspace/db";
 import {
   actionsTable,
   alertsTable,
@@ -19,23 +18,13 @@ import {
   type PostureSummary,
   type SecuritySignals,
 } from "../lib/blue-team/posture";
+import { DefenseStackResponse } from "@workspace/api-zod";
+import { bundledAgentVersion } from "../lib/agent-version";
 
 const router: IRouter = Router();
 
-const DIST_DIR = path.dirname(fileURLToPath(import.meta.url));
-const AGENT_SCRIPT_PATH = path.join(DIST_DIR, "lab-agent.ps1");
-
-// Same lookup the agent router uses. Split out so posture reports \"agent is
-// behind\" consistently with what the heartbeat advertises.
-const bundledAgentVersion = (() => {
-  try {
-    const source = readFileSync(AGENT_SCRIPT_PATH, "utf8");
-    const match = source.match(/\$script:AgentVersion\s*=\s*'([^']+)'/);
-    return match ? match[1] : null;
-  } catch {
-    return null;
-  }
-})();
+// Highest version advertised by any bundled agent (Windows PS or Linux Python).
+const latestAgentVersion = bundledAgentVersion();
 
 /**
  * Rebuilds the SecuritySignals the posture engine reads from what the agent has
@@ -98,7 +87,7 @@ router.get("/blue-team/posture", async (_req, res) => {
       },
       settings: settingsMap,
       security: signalsFor(computer),
-      bundledAgentVersion,
+bundledAgentVersion: latestAgentVersion,
       now: new Date(),
     });
     perComputer.push({
@@ -159,7 +148,7 @@ router.get("/blue-team/posture/:computerId", async (req, res) => {
     },
     settings: settingsMap,
     security: signalsFor(computer),
-    bundledAgentVersion,
+bundledAgentVersion: latestAgentVersion,
     now: new Date(),
   });
 
@@ -201,6 +190,159 @@ router.get("/blue-team/software", async (_req, res) => {
   }
 
   res.json({ machines: inventories.length, totalEntries, inventories });
+});
+
+/**
+ * Defense Stack — the live status of every defensive layer this deployment
+ * covers, mapped 1:1 to the SOC blueprint (perimeter/WAF, detection,
+ * assets, hosts, databases, data). States are computed from the same data
+ * the other blue-team endpoints use; blueprint layers that are deliberately
+ * out of scope are reported as "na" so the dashboard shows honest coverage.
+ */
+router.get("/blue-team/defense-stack", async (_req, res) => {
+  const [computers, settingsRows] = await Promise.all([
+    db.select().from(computersTable),
+    db.select({ key: settingsTable.key, value: settingsTable.value }).from(settingsTable),
+  ]);
+
+  const settingsMap: Record<string, string | null> = {};
+  for (const s of settingsRows) settingsMap[s.key] = s.value;
+
+  const summaries: Array<{ computerId: number; computerName: string; room: string; summary: PostureSummary }> = [];
+  for (const computer of computers) {
+    summaries.push({
+      computerId: computer.id,
+      computerName: computer.name,
+      room: computer.room,
+      summary: evaluatePosture({
+        computer: {
+          id: computer.id,
+          name: computer.name,
+          room: computer.room,
+          status: computer.status,
+          os: computer.os,
+          lastSeen: computer.lastSeen,
+          agentVersion: computer.agentVersion,
+          avEnabled: computer.avEnabled,
+          avSignature: computer.avSignature,
+          avLastScanAt: computer.avLastScanAt,
+          firewallEnabled: computer.firewallEnabled,
+          diskFree: computer.diskFree,
+          diskTotal: computer.diskTotal,
+        },
+        settings: settingsMap,
+        security: signalsFor(computer),
+bundledAgentVersion: latestAgentVersion,
+        now: new Date(),
+      }),
+    });
+  }
+
+  const lab = summariseLab(summaries);
+  const findings = correlateLab(summaries);
+
+  let inventoryMachines = 0;
+  let inventoryEntries = 0;
+  for (const c of computers) {
+    const software = Array.isArray(c.installedSoftware) ? c.installedSoftware : [];
+    if (software.length > 0) {
+      inventoryMachines += 1;
+      inventoryEntries += software.length;
+    }
+  }
+
+  let dbTotal = 0;
+  let dbOk = 0;
+  try {
+    const registry = await pool.query(
+      `SELECT count(*) AS total,
+              count(*) FILTER (WHERE status = 'ok') AS ok
+       FROM platform_db_connections`,
+    );
+    dbTotal = Number(registry.rows[0]?.total ?? 0);
+    dbOk = Number(registry.rows[0]?.ok ?? 0);
+  } catch {
+    // Fresh deployments may not have created the registry table yet.
+  }
+
+  const allowCountries = (process.env.WAF_ALLOW_COUNTRIES ?? "")
+    .split(",")
+    .map((c) => c.trim().toUpperCase())
+    .filter(Boolean);
+  const wafEnforce = process.env.WAF_ENFORCE !== "off";
+
+  const layers = [
+    {
+      id: "perimeter",
+      label: "Perimeter · WAF",
+      state: allowCountries.length > 0 ? (wafEnforce ? "active" : "warning") : "off",
+      detail:
+        allowCountries.length > 0
+          ? wafEnforce
+            ? `Geo-allowlist enforced (${allowCountries.length} countries), abusive-method & scanner-rule blocking on`
+            : `Geo-allowlist configured but observe-only (${allowCountries.length} countries)`
+          : "No country allowlist configured",
+      count: allowCountries.length,
+    },
+    {
+      id: "detection",
+      label: "Detection · Correlation",
+      state: findings.length > 0 ? "warning" : "active",
+      detail:
+        findings.length > 0
+          ? `${findings.length} open correlation finding${findings.length === 1 ? "" : "s"} across the lab`
+          : "No open correlation findings",
+      count: findings.length,
+    },
+    {
+      id: "hosts",
+      label: "Hosts · Hardening",
+      state: lab.failing > 0 ? "warning" : lab.computers > 0 ? "active" : "off",
+      detail:
+        lab.computers === 0
+          ? "No machines reported yet"
+          : `${lab.computers} machines, ${lab.failing} failing posture checks`,
+      count: lab.computers,
+    },
+    {
+      id: "assets",
+      label: "Assets · Inventory",
+      state: inventoryMachines > 0 ? "active" : "off",
+      detail:
+        inventoryMachines > 0
+          ? `${inventoryMachines} machines inventoried, ${inventoryEntries} software entries`
+          : "No software inventory yet (reported on the hourly channel)",
+      count: inventoryEntries,
+    },
+    {
+      id: "databases",
+      label: "Databases · Registry",
+      state: dbTotal > 0 ? (dbOk > 0 ? "active" : "warning") : "off",
+      detail:
+        dbTotal > 0
+          ? `${dbTotal} connection${dbTotal === 1 ? "" : "s"} registered, ${dbOk} healthy`
+          : "No Postgres connections registered in Admin → Databases",
+      count: dbTotal,
+    },
+    {
+      id: "data",
+      label: "Data · Protection",
+      state: dbOk > 0 ? "active" : "na",
+      detail:
+        dbOk > 0
+          ? "Manual snapshots available to push to healthy targets"
+          : "DLP/PAM/data masking deliberately out of scope; snapshots need a healthy DB target",
+      count: null,
+    },
+  ];
+
+  res.json(
+    DefenseStackResponse.parse({
+      layers,
+      lab: { computers: lab.computers, failing: lab.failing },
+      findings: findings.length,
+    }),
+  );
 });
 
 /**
