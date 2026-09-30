@@ -17,6 +17,20 @@ through the same locks:
   - wake: WoL magic-packet relay for offline machines
   - server_url_rotate: switch deployments without a reinstall
 
+Blue Team VPS protection feeds this same agent, on an hourly telemetry
+channel separate from the heartbeat:
+
+  - services: the running/enabled systemd unit list (see them in Admin →
+    Blue Team, with start/stop/restart/enable/disable controls)
+  - packages: the dpkg inventory, compared against a known-vulnerable list
+  - authFailures: sshd "Failed password" counts for the last ~24 hours
+  - fim: sha-256 baseline of /etc/ssh/sshd_config, /etc/passwd, /etc/shadow,
+    /etc/sudoers, /etc/crontab, unit/agent files and common web-server/ufw
+    configs; drift is reported as a posture finding
+  - sshRateLimited: reported with the heartbeat when ufw rate-limits SSH
+  - fw_limit_ssh / fw_unlimit_ssh: ufw `limit 22/tcp` toggle (~6 new
+    connections per 30 seconds per source) without touching iptables by hand
+
 Runs as a systemd service (root), one check-in per heartbeat interval, and
 self-updates by downloading the bundled script from the server.
 
@@ -33,6 +47,7 @@ Uninstall:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,7 +59,7 @@ import time
 import urllib.error
 import urllib.request
 
-LVOSEC_AGENT_VERSION = "1.23.0"
+LVOSEC_AGENT_VERSION = "1.24.0"
 
 CONFIG_DIR = "/etc/lvosec"
 CONFIG_PATH = "/etc/lvosec/agent.conf"
@@ -53,6 +68,12 @@ UNIT_PATH = "/etc/systemd/system/lvosec-agent.service"
 UNIT_NAME = "lvosec-agent"
 LOG_PATH = "/var/log/lvosec-agent.log"
 USB_RULE_PATH = "/etc/udev/rules.d/90-lvosec-block-usb.rules"
+
+# The Blue Team "VPS protection" telemetry channel: systemd services, package
+# inventory, sshd login failures and config-integrity (FIM) hashes are sent on
+# a slow timer so the 10-second heartbeat stays small.
+TELEMETRY_INTERVAL_SECONDS = 3600
+FIM_CONFIG_PATH = "/etc/lvosec/fim.json"
 
 USB_BLOCK_RULE = """# lvosec: block removable USB mass-storage, leave HID (keyboard/mouse) alone
 ACTION=="add", SUBSYSTEM=="usb", DRIVER=="usb-storage", ATTR{authorized}="0"
@@ -270,10 +291,27 @@ def probe_health(url, timeout=6):
         return False
 
 
+def ssh_rate_limited():
+    """True when ufw carries a limit rule for SSH (ufw `limit 22/tcp` or
+    `limit OpenSSH`), False when ufw is active without it, None when ufw is
+    not usable at all. Only reported as a signal when ufw answered."""
+    if not shutil.which("ufw"):
+        return None
+    rc, status = run(["ufw", "status"])
+    if rc != 0:
+        return None
+    limited = bool(
+        re.search(r"\b(?:22/tcp|OpenSSH)\b\s+LIMIT", status or "", re.IGNORECASE)
+        or re.search(r"\bLIMIT\b\s+.*\b(?:22/tcp|OpenSSH)\b", status or "", re.IGNORECASE)
+    )
+    return limited
+
+
 def compute_heartbeat(conf):
     hw = hardware()
     av = clam_av()
     fw = ufw_active()
+    rl = ssh_rate_limited()
     body = {
         "token": conf.get("TOKEN", ""),
         "os": os_label(),
@@ -297,10 +335,223 @@ def compute_heartbeat(conf):
         security["firewallAllProfiles"] = bool(fw)
     if av is not None:
         security["avRealtimeProtection"] = bool(av)
+    if rl is not None:
+        security["sshRateLimited"] = bool(rl)
     # posture: absent keys = not reported -> unknown, never a fabricated pass
     if security:
         body["security"] = security
     return body
+
+
+# ---------------------------------------------------------------------------
+# VPS telemetry collectors — the hourly Blue Team channel. Everything here is
+# best-effort: a failing collection returns None and the server stores what it
+# got, never fabricating data.
+# ---------------------------------------------------------------------------
+
+SERVICE_FILE_STATES = ("enabled", "disabled", "static", "masked", "generated", "indirect")
+
+
+def collect_services():
+    """systemd service units with their runtime state and boot enablement."""
+    rc, out = run(
+        ["systemctl", "list-unit-files", "--type=service", "--all", "--no-pager", "--plain", "--no-legend"],
+        timeout=30,
+    )
+    if rc != 0:
+        return None
+    units = {}
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        name = parts[0]
+        state = parts[-1] if len(parts) > 1 and parts[-1] in SERVICE_FILE_STATES else None
+        units[name] = {"name": name, "enabled": state}
+    rc2, out2 = run(
+        ["systemctl", "list-units", "--type=service", "--all", "--no-pager", "--plain", "--no-legend"],
+        timeout=30,
+    )
+    if rc2 == 0:
+        for line in (out2 or "").splitlines():
+            parts = line.split(None, 3)
+            if len(parts) < 2:
+                continue
+            entry = units.setdefault(parts[0], {"name": parts[0], "enabled": None})
+            entry["active"] = parts[1]
+            if len(parts) > 2:
+                entry["sub"] = parts[2]
+    result = [
+        {"name": u["name"], "active": u.get("active", "unknown"), "sub": u.get("sub"), "enabled": u.get("enabled")}
+        for u in units.values()
+    ]
+
+    def sort_key(item):
+        running = item["active"] == "active"
+        enabled = item.get("enabled") == "enabled"
+        return (0 if running or enabled else 1, item["name"])
+
+    result.sort(key=sort_key)
+    return result[:400]
+
+
+def collect_packages():
+    """dpkg package inventory (name + version). None when dpkg is unavailable."""
+    if not shutil.which("dpkg-query"):
+        return None
+    rc, out = run(["dpkg-query", "-W", "-f=${Package}\t${Version}\n"], timeout=60)
+    if rc != 0:
+        return None
+    packages = []
+    for line in (out or "").splitlines():
+        if "\t" not in line:
+            continue
+        name, version = line.split("\t", 1)
+        if name and version:
+            packages.append({"name": name, "version": version})
+    packages.sort(key=lambda p: p["name"])
+    return packages[:3000]
+
+
+AUTH_LOG_PATHS = ["/var/log/auth.log", "/var/log/secure"]
+
+
+def collect_authfail():
+    """sshd 'Failed password' lines in the current auth log. auth.log rotates
+    daily on Ubuntu/Debian, so this is approximately the last 24 hours, plus
+    the top source IPs. Falls back to journalctl when no auth log exists."""
+    count = 0
+    ip_counts = {}
+    found = False
+    for log_path in AUTH_LOG_PATHS:
+        if not os.path.exists(log_path):
+            continue
+        found = True
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if "Failed password" not in line:
+                        continue
+                    count += 1
+                    match = re.search(r"\bfrom\s+([0-9a-fA-F.:]+)\b", line)
+                    if match:
+                        ip = match.group(1)
+                        ip_counts[ip] = ip_counts.get(ip, 0) + 1
+        except OSError:
+            continue
+    if not found:
+        rc, out = run(
+            ["journalctl", "-u", "ssh", "--since", "24 hours ago", "--no-pager"],
+            timeout=20,
+        )
+        if rc == 0:
+            for line in (out or "").splitlines():
+                if "Failed password" not in line:
+                    continue
+                count += 1
+                match = re.search(r"\bfrom\s+([0-9a-fA-F.:]+)\b", line)
+                if match:
+                    ip = match.group(1)
+                    ip_counts[ip] = ip_counts.get(ip, 0) + 1
+    top = sorted(ip_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    return {
+        "count24h": count,
+        "topSources": [{"ip": ip, "count": c} for ip, c in top],
+    }
+
+
+# Config files whose hash changes are a plausible-compromise signal. The first
+# run snapshots them as the baseline; every later run compares against it.
+FIM_PATHS = [
+    "/etc/ssh/sshd_config",
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/hostname",
+    "/etc/crontab",
+    BIN_PATH,
+    UNIT_PATH,
+]
+FIM_OPTIONAL_PATHS = [
+    "/etc/nginx/nginx.conf",
+    "/etc/apache2/apache2.conf",
+    "/etc/ufw/user.rules",
+    "/etc/iptables/rules.v4",
+]
+
+
+def sha256_file(file_path):
+    try:
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def collect_fim():
+    """Hashes the protected file set and compares it to the stored baseline.
+
+    Returns {"status": "clean"|"drift", "changed": [...]}. The first run
+    writes the baseline and reports clean instead of crying wolf."""
+    watched = list(FIM_PATHS)
+    for optional in FIM_OPTIONAL_PATHS:
+        if optional and os.path.exists(optional):
+            watched.append(optional)
+    current = {}
+    for file_path in sorted(set(watched)):
+        digest = sha256_file(file_path)
+        if digest:
+            current[file_path] = digest
+    baseline = {}
+    try:
+        with open(FIM_CONFIG_PATH, "r", encoding="utf-8") as fh:
+            parsed = json.loads(fh.read() or "{}")
+        if isinstance(parsed, dict):
+            baseline = parsed
+    except (OSError, ValueError):
+        baseline = {}
+    if not baseline:
+        try:
+            with open(FIM_CONFIG_PATH, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(current, indent=2))
+        except OSError:
+            pass
+        return {"status": "clean", "changed": []}
+    changed = [
+        {"path": file_path, "hash": digest}
+        for file_path, digest in sorted(current.items())
+        if baseline.get(file_path) != digest
+    ]
+    return {"status": "drift" if changed else "clean", "changed": changed[:40]}
+
+
+def maybe_send_telemetry(server_url, conf):
+    """Hourly push of the VPS telemetry channel. Never retries immediately; the
+    next cycle simply tries again after the interval."""
+    now = time.time()
+    last = 0
+    try:
+        last = float(conf.get("LAST_TELEMETRY") or 0)
+    except (TypeError, ValueError):
+        last = 0
+    if now - last < TELEMETRY_INTERVAL_SECONDS:
+        return
+    payload = {
+        "token": conf.get("TOKEN", ""),
+        "services": collect_services(),
+        "packages": collect_packages(),
+        "authFailures": collect_authfail(),
+        "fim": collect_fim(),
+    }
+    status, _ = api(server_url, "/api/agent/telemetry", payload)
+    if status == 200:
+        conf["LAST_TELEMETRY"] = str(int(now))
+        write_conf(conf)
+    else:
+        log("telemetry push failed (%s) — will retry next interval" % status)
 
 
 def ensure_registered(server_url, conf, name_override, room_override):
@@ -403,6 +654,66 @@ def action_fw_disable():
     if proc.returncode != 0 and "status: inactive" not in out.lower():
         return False, "ufw disable failed: %s" % out[:200]
     return True, "ufw disabled — machine exposed to the internet"
+
+
+SERVICE_ACTION_COMMANDS = {
+    "service_start": ["systemctl", "start"],
+    "service_stop": ["systemctl", "stop"],
+    "service_restart": ["systemctl", "restart"],
+    "service_enable": ["systemctl", "enable"],
+    "service_disable": ["systemctl", "disable"],
+}
+SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.@+-]+$")
+
+
+def action_service(service, operation):
+    if not service:
+        return False, "No service name supplied in the action payload"
+    if not SERVICE_NAME_RE.match(service):
+        return False, "Invalid service name: %r" % service
+    cmd = SERVICE_ACTION_COMMANDS.get(operation)
+    if not cmd:
+        return False, "Unsupported service operation: %s" % operation
+    rc, _ = run(cmd + [service], timeout=30)
+    verb = operation.replace("service_", "")
+    if rc == 0:
+        return True, "systemctl %s %s" % (verb, service)
+    return False, "systemctl %s %s failed (exit %s)" % (verb, service, rc)
+
+
+def action_fw_rate_limit_ssh():
+    """ufw `limit` caps SSH at ~6 new connections per 30 seconds per source —
+    the basic brute-force damper without touching iptables directly."""
+    if not shutil.which("ufw"):
+        return False, "ufw is not installed — install it with: sudo apt install ufw"
+    rc, status = run(["ufw", "status"])
+    if rc != 0:
+        return False, "ufw status failed — is the firewall active?"
+    if re.search(r"\b(?:22/tcp|OpenSSH)\b\s+LIMIT", status or "", re.IGNORECASE):
+        return True, "SSH is already rate-limited (ufw limit rule present)"
+    rc, _ = run(["ufw", "limit", "OpenSSH"])
+    if rc != 0:
+        rc, _ = run(["ufw", "limit", "22/tcp"])
+    if rc != 0:
+        return False, "Could not add the ufw limit rule for SSH"
+    return True, "SSH rate limiting applied — ufw limit 22/tcp (max ~6 new connections/30s per source)"
+
+
+def action_fw_unrate_limit_ssh():
+    """Removes the SSH limit rule and re-adds a plain allow so SSH stays up."""
+    if not shutil.which("ufw"):
+        return False, "ufw is not installed — install it with: sudo apt install ufw"
+    removed = False
+    rc, _ = run(["ufw", "delete", "limit", "22/tcp"])
+    if rc != 0:
+        rc, _ = run(["ufw", "delete", "limit", "OpenSSH"])
+    removed = rc == 0
+    rc2, _ = run(["ufw", "allow", "22/tcp"])
+    if rc2 != 0:
+        run(["ufw", "allow", "OpenSSH"])
+    if removed:
+        return True, "SSH rate limiting removed; SSH remains reachable by its plain allow rule"
+    return True, "No SSH limit rule was present (plain allow ensured)"
 
 
 def usb_unmount_removables():
@@ -514,6 +825,12 @@ def handle_actions(server_url, token, pending):
             success, detail = action_wake(payload)
         elif action_name == "server_url_rotate":
             success, detail = action_rotate(server_url, payload)
+        elif action_name == "fw_limit_ssh":
+            success, detail = action_fw_rate_limit_ssh()
+        elif action_name == "fw_unlimit_ssh":
+            success, detail = action_fw_unrate_limit_ssh()
+        elif action_name in SERVICE_ACTION_COMMANDS:
+            success, detail = action_service(payload.get("service"), action_name)
         # remote_view / remote_input / remote_control / disable_rdp / av_* /
         # push_file / delete_file / list_files / sleep are Windows concerns and
         # are honestly reported as failed rather than silently ignored.
@@ -600,6 +917,8 @@ def cycle(conf, name_override):
             return conf, 120
     if isinstance(data, dict) and data.get("pendingActions"):
         handle_actions(server_url, conf.get("TOKEN", ""), data["pendingActions"])
+    # Hourly VPS telemetry channel — services, packages, login failures, FIM.
+    maybe_send_telemetry(server_url, conf)
     return conf, int(conf.get("HEARTBEAT_SECONDS") or 10)
 
 

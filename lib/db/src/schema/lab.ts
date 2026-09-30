@@ -48,6 +48,18 @@ export const computersTable = pgTable("lab_computers", {
   // engine (lib/blue-team/posture.ts). Tri-state in spirit: a missing key means
   // "not reported yet", which the engine returns as `unknown`, never `pass`.
   securitySignals: jsonb("security_signals"),
+  /**
+   * VPS (Linux lvosec agent) telemetry. Reported hourly on the dedicated
+   * /api/agent/telemetry channel so the heartbeat stays small:
+   *   - services: systemd unit list [{name, active, sub, enabled}]
+   *   - packages: dpkg inventory [{name, version}]
+   *   - authFailures: sshd failed-login counter {count24h, topSources}
+   *   - fimState: config-integrity report {status: clean|drift, changed}
+   */
+  services: jsonb("services"),
+  packages: jsonb("packages"),
+  authFailures: jsonb("auth_failures"),
+  fimState: jsonb("fim_state"),
   // Installed-software snapshot, reported by the agent on a slow timer (not on
   // every heartbeat). Shape matches SoftwareEntry (name, version, publisher).
   installedSoftware: jsonb("installed_software"),

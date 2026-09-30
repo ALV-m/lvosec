@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { Fragment, useState, type FormEvent } from "react";
 import {
   useGetAdminBlueTeamDefenseStack,
   useGetAdminBlueTeamPosture,
@@ -18,25 +18,34 @@ import {
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
   Copy,
   Crosshair,
   Database,
+  Fingerprint,
   Globe,
   Layers,
   Lock,
   LockOpen,
   MessageSquare,
+  Play,
   Plus,
   Power,
   Radar,
+  RotateCcw,
   Search,
   Server,
+  ServerCog,
   Shield,
   ShieldCheck,
   ShieldOff,
   ShieldQuestion,
+  Square,
+  ToggleLeft,
+  ToggleRight,
   Usb,
+  Wrench,
   XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -96,6 +105,24 @@ const CATEGORY_LABEL: Record<string, string> = {
   data_protection: "Data protection",
   configuration: "Configuration",
 };
+
+// Mirrors the server's curated end-of-life marker list (posture.ts) so the
+// Blue Team table can badge patch risk without another fetch.
+const EOL_MARKERS: Array<{ name: string; prefixes: string[] }> = [
+  { name: "openssl", prefixes: ["1.1.1"] }, // 1.1.1 EOL since Sept 2023
+  { name: "bash", prefixes: ["4."] }, // 4.x EOL since 2019
+  { name: "php", prefixes: ["7.", "8.0.", "8.1."] }, // 8.1 EOL Nov 2024
+  { name: "python3", prefixes: ["3.6", "3.7", "3.8"] }, // 3.8 EOL Oct 2024
+];
+
+const MACHINE_AUTHFAIL_THRESHOLD = 10;
+
+function isEolPackage(pkg: { name: string; version?: string | null }): boolean {
+  const rule = EOL_MARKERS.find((r) => r.name === pkg.name.toLowerCase());
+  if (!rule || !pkg.version) return false;
+  const version = pkg.version.toLowerCase();
+  return rule.prefixes.some((prefix) => version === prefix || version.startsWith(prefix));
+}
 
 function SeverityBadge({ severity, state }: { severity: PostureSeverity; state: PostureState }) {
   if (state === "pass") return <Badge variant="success">OK</Badge>;
@@ -180,7 +207,11 @@ function DefenseStackSection() {
 
   const layerIcon: Record<string, React.ReactNode> = {
     perimeter: <Globe className="size-4 text-muted-foreground" />,
+    brute_force: <Radar className="size-4 text-muted-foreground" />,
     detection: <Crosshair className="size-4 text-muted-foreground" />,
+    fim: <Fingerprint className="size-4 text-muted-foreground" />,
+    patch: <Wrench className="size-4 text-muted-foreground" />,
+    services: <ServerCog className="size-4 text-muted-foreground" />,
     hosts: <ShieldCheck className="size-4 text-muted-foreground" />,
     assets: <Database className="size-4 text-muted-foreground" />,
     databases: <Database className="size-4 text-muted-foreground" />,
@@ -282,6 +313,7 @@ function VpsMachinesSection() {
   const vpsMachines = machines.filter((machine) => machine.kind === "vps");
 
   const [busy, setBusy] = useState<string | null>(null);
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [restartTarget, setRestartTarget] = useState<PlatformMachine | null>(null);
   const [messageTarget, setMessageTarget] = useState<PlatformMachine | null>(null);
   const [messageText, setMessageText] = useState("");
@@ -305,13 +337,18 @@ function VpsMachinesSection() {
     machine: PlatformMachine,
     action: PlatformMachineAction,
     message?: string,
+    payload?: Record<string, unknown>,
   ) => {
     setBusy(keyOf(machine));
     try {
       const result = await actionMutation.mutateAsync({
         tenantId: machine.tenantId,
         computerId: machine.id,
-        data: message ? { action, message } : { action },
+        data: {
+          action,
+          ...(message ? { message } : {}),
+          ...(payload ? { payload } : {}),
+        },
       });
       toast.success(result.message ?? `${action.replaceAll("_", " ")} queued`);
       return true;
@@ -339,6 +376,21 @@ function VpsMachinesSection() {
       setMessageTarget(null);
       setMessageText("");
     }
+  };
+
+  // Service-level controls run through the same action queue as everything
+  // else; the agent picks them up on its next poll.
+  const runService = async (
+    machine: PlatformMachine,
+    action: PlatformMachineAction,
+    service: string,
+  ) => {
+    await run(machine, action, undefined, { service });
+  };
+
+  const toggleRateLimit = async (machine: PlatformMachine) => {
+    const limit = machine.sshRateLimited !== true;
+    await run(machine, limit ? "fw_limit_ssh" : "fw_unlimit_ssh");
   };
 
   const copyInstall = async () => {
@@ -378,8 +430,11 @@ function VpsMachinesSection() {
                 Every Linux server lvosec protects, across all tenants — a
                 separate service from lab computers. Deploy the lvosec Linux
                 agent on a server (Contabo-style Ubuntu/Debian VPS) and firewall,
-                USB, lock, restart and operator messages run from here through
-                the normal agent action queue.
+                USB, SSH rate limiting, lock, restart and operator messages run
+                from here through the normal agent action queue. Expand a VPS to
+                see its systemd services and start/stop, restart or enable them.
+                The hourly telemetry channel also reports failed ssh logins,
+                config-integrity drift and the package inventory.
                 {vpsMachines.length > 0 &&
                   ` ${vpsMachines.length} cloud VPS · ${onlineCount} online` +
                     (firewallOffCount > 0 ? ` · ${firewallOffCount} firewalls OFF` : "")}
@@ -401,6 +456,7 @@ function VpsMachinesSection() {
                 <TableHead>Firewall</TableHead>
                 <TableHead>USB</TableHead>
                 <TableHead>Last seen</TableHead>
+                <TableHead>Services</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
@@ -408,7 +464,7 @@ function VpsMachinesSection() {
               {machinesQuery.isLoading ? (
                 Array.from({ length: 3 }).map((_, i) => (
                   <TableRow key={i}>
-                    <TableCell colSpan={8}>
+                    <TableCell colSpan={9}>
                       <Skeleton className="h-8 w-full" />
                     </TableCell>
                   </TableRow>
@@ -416,7 +472,7 @@ function VpsMachinesSection() {
               ) : vpsMachines.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={8}
+                    colSpan={9}
                     className="py-8 text-center text-sm text-muted-foreground"
                   >
                     No cloud VPS protected yet. Use <strong>Add VPS</strong> to
@@ -426,7 +482,8 @@ function VpsMachinesSection() {
                 </TableRow>
               ) : (
                 vpsMachines.map((machine) => (
-                  <TableRow key={keyOf(machine)}>
+                  <Fragment key={keyOf(machine)}>
+                  <TableRow>
                     <TableCell>
                       <div className="flex flex-col">
                         <span className="flex items-center gap-1.5 font-medium">
@@ -439,6 +496,7 @@ function VpsMachinesSection() {
                           {machine.os ?? machine.userName ?? "—"} · agent{" "}
                           {machine.agentVersion ?? "?"}
                         </span>
+                        <TelemetryBadges machine={machine} />
                       </div>
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground">
@@ -468,6 +526,30 @@ function VpsMachinesSection() {
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground">
                       {lastSeenLabel(machine.lastSeen)}
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="px-2"
+                        aria-expanded={expandedKey === keyOf(machine)}
+                        aria-label={expandedKey === keyOf(machine) ? "Hide services" : "Show services"}
+                        onClick={() =>
+                          setExpandedKey(expandedKey === keyOf(machine) ? null : keyOf(machine))
+                        }
+                      >
+                        <ChevronDown
+                          className={cn(
+                            "size-4 text-muted-foreground transition-transform",
+                            expandedKey === keyOf(machine) && "rotate-180",
+                          )}
+                        />
+                        <span className="text-xs">
+                          {(machine.services ?? []).length > 0
+                            ? `${machine.services?.length} services`
+                            : "Services"}
+                        </span>
+                      </Button>
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center justify-end gap-1">
@@ -546,6 +628,18 @@ function VpsMachinesSection() {
                       </div>
                     </TableCell>
                   </TableRow>
+                  {expandedKey === keyOf(machine) ? (
+                    <TableRow className="hover:bg-transparent">
+                      <TableCell colSpan={9} className="bg-muted/40 px-4 py-3">
+                        <VpsServicesPanel
+                          machine={machine}
+                          onAction={runService}
+                          onRateLimit={toggleRateLimit}
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                  </Fragment>
                 ))
               )}
             </TableBody>
@@ -699,6 +793,223 @@ function VpsMachinesSection() {
         </DialogContent>
       </Dialog>
     </>
+  );
+}
+
+function TelemetryBadges({ machine }: { machine: PlatformMachine }) {
+  const authCount = machine.authFailures?.count24h ?? null;
+  const fim = machine.fimState?.status ?? null;
+  const vulnerableCount = (machine.packages ?? []).filter(isEolPackage).length;
+  return (
+    <div className="mt-1 flex flex-wrap gap-1">
+      {authCount !== null ? (
+        <Badge
+          variant={authCount >= MACHINE_AUTHFAIL_THRESHOLD ? "destructive" : "secondary"}
+          className="px-1.5 py-0 text-[10px]"
+        >
+          Brute {authCount}
+        </Badge>
+      ) : null}
+      {fim !== null ? (
+        <Badge
+          variant={fim === "drift" ? "destructive" : "success"}
+          className="px-1.5 py-0 text-[10px]"
+        >
+          FIM {fim === "drift" ? "drift" : "clean"}
+        </Badge>
+      ) : null}
+      {machine.packages ? (
+        <Badge
+          variant={vulnerableCount > 0 ? "destructive" : "secondary"}
+          className="px-1.5 py-0 text-[10px]"
+        >
+          Patch {vulnerableCount > 0 ? `${vulnerableCount} risky` : "ok"}
+        </Badge>
+      ) : null}
+      {machine.sshRateLimited ? (
+        <Badge variant="info" className="px-1.5 py-0 text-[10px]">
+          SSH limited
+        </Badge>
+      ) : null}
+    </div>
+  );
+}
+
+function VpsServicesPanel({
+  machine,
+  onAction,
+  onRateLimit,
+}: {
+  machine: PlatformMachine;
+  onAction: (machine: PlatformMachine, action: PlatformMachineAction, service: string) => void;
+  onRateLimit: (machine: PlatformMachine) => void;
+}) {
+  const services = machine.services ?? [];
+  const authCount = machine.authFailures?.count24h ?? 0;
+  const authSources = machine.authFailures?.topSources ?? [];
+  const fim = machine.fimState;
+  const vulnerable = (machine.packages ?? []).filter(isEolPackage);
+  const rateLimited = machine.sshRateLimited === true;
+
+  return (
+    <div className="space-y-3 py-1">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+          {machine.packages ? (
+            <span>
+              <span className="font-medium text-foreground">Patch:</span>{" "}
+              {vulnerable.length > 0
+                ? `${vulnerable.length} end-of-life package(s) — ${vulnerable
+                    .slice(0, 3)
+                    .map((v) => `${v.name} ${v.version}`)
+                    .join(", ")}`
+                : "no flagged packages"}
+            </span>
+          ) : (
+            <span>Patch: waiting for package inventory…</span>
+          )}
+          <span aria-hidden className="text-border">
+            •
+          </span>
+          {machine.authFailures ? (
+            <span>
+              <span className="font-medium text-foreground">Brute:</span>{" "}
+              {authCount > 0
+                ? `${authCount} failed ssh logins/24h${
+                    authSources.length > 0
+                      ? ` — ${authSources
+                          .slice(0, 3)
+                          .map((s) => `${s.ip} (${s.count})`)
+                          .join(", ")}`
+                      : ""
+                  }`
+                : "clean"}
+            </span>
+          ) : (
+            <span>Brute: no login-failure data yet</span>
+          )}
+          <span aria-hidden className="text-border">
+            •
+          </span>
+          {fim?.status ? (
+            <span>
+              <span className="font-medium text-foreground">Integrity:</span>{" "}
+              {fim.status === "drift"
+                ? `${(fim.changed ?? []).length} protected file(s) changed`
+                : "baseline clean"}
+            </span>
+          ) : (
+            <span>Integrity: baseline not yet established</span>
+          )}
+        </div>
+        <Button variant="outline" size="sm" onClick={() => onRateLimit(machine)}>
+          <Shield className="size-4" />
+          {rateLimited ? "Remove SSH rate limit" : "Rate-limit SSH"}
+        </Button>
+      </div>
+
+      {services.length === 0 ? (
+        <p className="rounded-md border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
+          No systemd services reported yet — the Linux agent (1.24+) sends the
+          service list on its hourly telemetry push.
+        </p>
+      ) : (
+        <div className="overflow-x-auto rounded-md border">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b bg-muted/40 text-left text-[11px] uppercase tracking-wide text-muted-foreground">
+                <th className="px-3 py-2 font-medium">Service</th>
+                <th className="px-3 py-2 font-medium">State</th>
+                <th className="px-3 py-2 font-medium">Boot</th>
+                <th className="px-3 py-2 text-right font-medium">Control</th>
+              </tr>
+            </thead>
+            <tbody>
+              {services.map((service) => (
+                <tr key={service.name} className="border-b last:border-0">
+                  <td className="max-w-[18rem] truncate px-3 py-2 font-mono text-xs">
+                    {service.name}
+                  </td>
+                  <td className="px-3 py-2">
+                    <Badge
+                      variant={
+                        service.active === "active"
+                          ? "success"
+                          : service.active === "failed"
+                            ? "destructive"
+                            : "secondary"
+                      }
+                      className="px-1.5 py-0 text-[10px]"
+                    >
+                      {service.active ?? "unknown"}
+                      {service.sub && service.sub !== service.active
+                        ? ` · ${service.sub}`
+                        : ""}
+                    </Badge>
+                  </td>
+                  <td className="px-3 py-2 text-xs text-muted-foreground">
+                    {service.enabled ?? "—"}
+                  </td>
+                  <td className="px-3 py-2">
+                    <div className="flex items-center justify-end gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title={`Start ${service.name}`}
+                        aria-label={`Start ${service.name}`}
+                        onClick={() => onAction(machine, "service_start", service.name)}
+                        disabled={service.active === "active"}
+                      >
+                        <Play className="size-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title={`Stop ${service.name}`}
+                        aria-label={`Stop ${service.name}`}
+                        onClick={() => onAction(machine, "service_stop", service.name)}
+                        disabled={service.active !== "active"}
+                      >
+                        <Square className="size-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title={`Restart ${service.name}`}
+                        aria-label={`Restart ${service.name}`}
+                        onClick={() => onAction(machine, "service_restart", service.name)}
+                      >
+                        <RotateCcw className="size-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title={`Enable ${service.name} at boot`}
+                        aria-label={`Enable ${service.name} at boot`}
+                        onClick={() => onAction(machine, "service_enable", service.name)}
+                        disabled={service.enabled === "enabled"}
+                      >
+                        <ToggleRight className="size-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title={`Disable ${service.name} at boot`}
+                        aria-label={`Disable ${service.name} at boot`}
+                        onClick={() => onAction(machine, "service_disable", service.name)}
+                        disabled={service.enabled === "disabled"}
+                      >
+                        <ToggleLeft className="size-4" />
+                      </Button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }
 

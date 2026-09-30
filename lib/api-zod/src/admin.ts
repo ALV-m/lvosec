@@ -1,6 +1,7 @@
 import * as zod from "zod";
 import { CreateComputerActionResponse } from "./generated/api";
 import { TenantAccount, TenantStatus } from "./tenant";
+import { AuthFailureReport, FimReport, PackageEntry, ServiceEntry } from "./agent";
 
 export const AdminAccount = zod.object({
   id: zod.number(),
@@ -164,6 +165,13 @@ export const PlatformMachine = zod.object({
   firewallProfiles: zod.string().nullable(),
   ipAddress: zod.string().nullable(),
   macAddress: zod.string().nullable(),
+  /** VPS (Linux agent) telemetry, reported on the hourly channel. */
+  services: zod.array(ServiceEntry).nullish(),
+  packages: zod.array(PackageEntry).nullish(),
+  authFailures: AuthFailureReport.nullish(),
+  fimState: FimReport.nullish(),
+  /** VPS only: ufw currently rate-limits SSH (reported with the heartbeat). */
+  sshRateLimited: zod.boolean().nullable(),
 });
 export type PlatformMachine = zod.infer<typeof PlatformMachine>;
 
@@ -182,6 +190,14 @@ export const PlatformMachineAction = zod.enum([
   "allow_usb",
   "fw_enable",
   "fw_disable",
+  // VPS (Linux agent): service management + SSH rate limiting.
+  "service_start",
+  "service_stop",
+  "service_restart",
+  "service_enable",
+  "service_disable",
+  "fw_limit_ssh",
+  "fw_unlimit_ssh",
 ]);
 export type PlatformMachineAction = zod.infer<typeof PlatformMachineAction>;
 

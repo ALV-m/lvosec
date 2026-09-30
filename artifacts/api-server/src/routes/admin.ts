@@ -594,6 +594,17 @@ const mapPlatformMachine = (
   firewallProfiles: computer.firewallProfiles,
   ipAddress: computer.ipAddress,
   macAddress: computer.macAddress,
+  // VPS telemetry from the hourly channel (services, packages, login
+  // failures, FIM). JSONB columns come back as unknown; the zod parse on the
+  // response shape re-validates them.
+  services: computer.services as PlatformMachine["services"] | null,
+  packages: computer.packages as PlatformMachine["packages"] | null,
+  authFailures: computer.authFailures as PlatformMachine["authFailures"] | null,
+  fimState: computer.fimState as PlatformMachine["fimState"] | null,
+  // Surfaces the Linux agent's sshRateLimited heartbeat signal so Blue Team
+  // can toggle the ufw limit rule with visible state.
+  sshRateLimited:
+    (computer.securitySignals as { sshRateLimited?: boolean } | null)?.sshRateLimited ?? null,
 });
 
 router.get("/admin/machines", async (_req, res): Promise<void> => {
